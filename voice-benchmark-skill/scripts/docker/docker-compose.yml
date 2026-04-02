@@ -1,0 +1,51 @@
+# Voice Latency Benchmark - Docker Compose
+# 全球部署时，每个节点运行此 compose
+
+version: "3.8"
+
+services:
+  # Appium 服务器
+  appium:
+    image: appium/appium:latest
+    container_name: voice-benchmark-appium
+    ports:
+      - "4723:4723"
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb  # USB 设备透传（真机场景）
+    environment:
+      - APPIUM_HOST=0.0.0.0
+      - APPIUM_PORT=4723
+    privileged: true
+    networks:
+      - benchmark-net
+
+  # 测试运行器
+  benchmark:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: voice-benchmark-runner
+    depends_on:
+      - appium
+    volumes:
+      - ../results:/app/results
+      - ../configs:/app/configs
+    environment:
+      # 设备连接（通过 ADB over TCP 连接云手机）
+      - ADB_DEVICE_HOST=${ADB_DEVICE_HOST:-host.docker.internal}
+      - ADB_DEVICE_PORT=${ADB_DEVICE_PORT:-5555}
+      # 节点信息
+      - NODE_ID=${NODE_ID:-local}
+      - NODE_REGION=${NODE_REGION:-local}
+      # Appium 连接
+      - APPIUM_HOST=appium
+      - APPIUM_PORT=4723
+    networks:
+      - benchmark-net
+    command: >
+      python3 src/runner.py
+      --config configs/default.yaml
+
+networks:
+  benchmark-net:
+    driver: bridge

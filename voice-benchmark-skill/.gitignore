@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Test results (大文件，不提交)
+scripts/results/*.csv
+scripts/results/*.json
+scripts/results/*.html
+scripts/results/*.log
+scripts/results/**/*.png
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Virtual env
+.venv/
+venv/
+env/

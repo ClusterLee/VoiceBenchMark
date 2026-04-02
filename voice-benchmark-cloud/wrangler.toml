@@ -1,0 +1,8 @@
+name = "voice-benchmark-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "voice-benchmark"
+database_id = "1cb987f7-258e-42bd-abd5-e20112f61c49"

@@ -1,0 +1,55 @@
+# Voice Latency Benchmark 默认配置
+
+# 节点信息（node_id 设为 "auto" 时自动生成 {os}-{hostname}）
+node_id: "auto"
+node_region: "cn-shenzhen"
+
+# 设备配置
+device:
+  platform: "Android"
+  device_name: "emulator-5554"
+  platform_version: "11"
+  automation_name: "UiAutomator2"
+  appium_host: "127.0.0.1"
+  appium_port: 4723
+
+# 音频配置
+audio:
+  input_file: "assets/audio/hello_nihao_edge_48k.wav"  # Edge TTS 48kHz "您好"
+  sample_rate: 16000
+  vad_aggressiveness: 2
+  vad_frame_duration_ms: 30
+  silence_threshold_db: -40.0
+  record_duration: 45.0
+  record_sample_rate: 44100
+
+# 测试配置
+benchmark:
+  num_rounds: 3
+  round_interval: 1.0
+  record_screen: true
+  output_dir: "results"
+  report_formats:
+    - json
+    - csv
+    - html
+
+# APP 配置 (基于 2026-03-30 Appium Inspector 校准)
+apps:
+  yuanbao:
+    package: "com.tencent.hunyuan.app.chat"
+    activity: ".biz.login.v2.HYLoginMainActivity"
+    response_timeout: 30.0
+    post_login_wait: 5.0
+    # 元宝使用 Compose UI，顶栏按钮无 resource-id / content-desc
+    # 电话图标坐标 bounds: [794,89][920,215]，中心 (857, 152)
+    voice_button_xpath: '//android.view.View[@bounds="[794,89][920,215]"]'
+
+  doubao:
+    package: "com.larus.nova"
+    activity: "com.larus.home.impl.alias.AliasActivity1"
+    response_timeout: 30.0
+    post_login_wait: 5.0
+    # 豆包有完整的 resource-id
+    voice_button_id: "com.larus.nova:id/real_time_call"
+    voice_button_xpath: '//android.widget.ImageView[@content-desc="打电话"]'
