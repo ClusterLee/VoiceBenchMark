@@ -35,9 +35,17 @@ check_prereqs() {
     # 检查模拟器
     if ! adb devices 2>/dev/null | grep -q "emulator"; then
         echo "❌ 未检测到 Android 模拟器。请先启动："
-        echo "   ~/Library/Android/sdk/emulator/emulator -avd voice_benchmark -no-snapshot-load -grpc 8554"
-        echo "   ⚠️  注意: 不要加 -no-audio，否则虚拟麦克风和音频输出都会被禁用"
+        echo "   ~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load"
+        echo "   ⚠️  必须加 -no-snapshot-load，否则音频 HAL 可能 I/O error（听不到声音）"
+        echo "   ⚠️  禁止加 -no-audio，否则虚拟麦克风和音频输出都会被禁用"
         exit 1
+    fi
+    
+    # 检查音频 HAL 健康（pcm_writei I/O error = 需要冷启动模拟器）
+    pcm_errors=$(adb shell "logcat -d | grep -c 'pcm_writei.*I/O error'" 2>/dev/null || echo "0")
+    if [ "$pcm_errors" -gt "0" ] 2>/dev/null; then
+        echo "⚠️  检测到音频 HAL I/O 错误 (${pcm_errors} 次)，宿主机可能听不到声音"
+        echo "   建议: adb emu kill && sleep 5 && emulator -avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load"
     fi
     
     # 检查 Appium
@@ -64,11 +72,15 @@ setup_audio() {
     # 必须强制切到扬声器模式才能在宿主机听到声音
     adb shell content insert --uri content://settings/system \
         --bind name:s:speakerphone_on --bind value:s:1 2>/dev/null
-    # 拉满所有音量
-    for i in $(seq 1 15); do
-        adb shell input keyevent KEYCODE_VOLUME_UP 2>/dev/null
-    done
-    echo "✅ 音频路由已切到扬声器 + 音量最大"
+    # 精确设置非通话音频流的音量到最大（VOICE_CALL 只能在通话中修改）
+    # 使用 cmd media_session volume（正确的 ADB 音量命令）
+    adb shell cmd media_session volume --stream 1 --set 7  2>/dev/null  # SYSTEM (max 7)
+    adb shell cmd media_session volume --stream 2 --set 7  2>/dev/null  # RING (max 7)
+    adb shell cmd media_session volume --stream 3 --set 15 2>/dev/null  # MUSIC (max 15)
+    adb shell cmd media_session volume --stream 4 --set 7  2>/dev/null  # ALARM (max 7)
+    adb shell cmd media_session volume --stream 5 --set 7  2>/dev/null  # NOTIFICATION (max 7)
+    echo "✅ 音频路由已切到扬声器 + 所有音量最大"
+    echo "   (VOICE_CALL 音量将在进入通话后自动设置)"
     echo ""
 }
 

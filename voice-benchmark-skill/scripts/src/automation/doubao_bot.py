@@ -56,6 +56,8 @@ class DoubaoBot(BaseBot):
         SPEAK_AREA = "com.larus.nova:id/speak_normal"
         BACK_ICON = "com.larus.nova:id/back_icon"
         SIDEBAR_NEW_CHAT = "com.larus.nova:id/side_bar_create_conversation"
+        # 对话列表页面右上角「创建新对话」按钮 (✏️ 图标)
+        LIST_NEW_CHAT = "com.larus.nova:id/right_img"
 
         # 通话界面
         CALL_ROOT = "com.larus.nova:id/realtime_call_root"
@@ -390,7 +392,7 @@ class DoubaoBot(BaseBot):
         """确保豆包 APP 在前台"""
         try:
             self.driver.activate_app(self.app_config.package)
-            time.sleep(3)
+            time.sleep(1)
             logger.info("[豆包] APP 已激活到前台")
         except Exception as e:
             logger.warning(f"[豆包] activate_app 失败: {e}，尝试用 ADB...")
@@ -402,9 +404,42 @@ class DoubaoBot(BaseBot):
                      f"{self.app_config.package}/{self.app_config.activity}"],
                     capture_output=True, timeout=10
                 )
-                time.sleep(3)
+                time.sleep(1)
             except Exception:
                 pass
+
+    def _is_in_chat_list(self):
+        """判断是否在对话列表页面（底部 Tab 有「对话」「智能体」等入口）"""
+        try:
+            # 对话列表页顶部标题文字为"对话"，resource-id=title_text
+            title_els = self.driver.find_elements(
+                AppiumBy.ID, "com.larus.nova:id/title_text",
+            )
+            if title_els and title_els[0].text == "对话":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _click_new_chat_in_list(self) -> bool:
+        """在对话列表页点击「创建新对话」按钮，返回是否成功"""
+        try:
+            new_chat_btns = self.driver.find_elements(
+                AppiumBy.ACCESSIBILITY_ID, "创建新对话",
+            )
+            if not new_chat_btns:
+                new_chat_btns = self.driver.find_elements(
+                    AppiumBy.ID, self.IDs.LIST_NEW_CHAT,
+                )
+            if new_chat_btns:
+                new_chat_btns[0].click()
+                logger.info("[豆包] 已点击「创建新对话」按钮")
+                time.sleep(1.5)
+                logger.info("[豆包] ✅ 新对话窗口已创建")
+                return True
+        except Exception as e:
+            logger.warning(f"[豆包] 点击「创建新对话」失败: {e}")
+        return False
 
     def start_new_conversation(self):
         """新建一个干净的对话窗口
@@ -412,9 +447,10 @@ class DoubaoBot(BaseBot):
         流程：
         1. 确保 APP 在前台
         2. 如果在通话界面，先挂断
-        3. 从对话页点击 back_icon 打开侧边栏
-        4. 点击「创建新对话」按钮
-        5. 验证进入新对话页面（标题="新对话"）
+        3. 检查当前位置，选择最合适的策略：
+           a. 对话列表页 → 点击右上角「创建新对话」按钮
+           b. 对话详情页 → 先回到对话列表页，再新建
+           c. 其他页面 → 连按 back 回到对话列表页
         """
         logger.info("[豆包] 新建对话窗口...")
 
@@ -427,63 +463,86 @@ class DoubaoBot(BaseBot):
         # 确保 APP 在前台
         self._ensure_app_foreground()
 
-        # 尝试直接找侧边栏「创建新对话」按钮（可能侧边栏已展开）
+        # 诊断：检测当前页面状态
+        in_chat_list = self._is_in_chat_list()
+        in_chat_screen = self._is_in_chat_screen()
+        logger.debug(
+            f"[豆包] 页面状态: 对话列表={in_chat_list}, "
+            f"对话详情={in_chat_screen}"
+        )
+
+        # ---- 策略 1: 已在对话列表页 → 直接点新建 ----
+        if in_chat_list:
+            logger.info("[豆包] 当前在对话列表页，点击「创建新对话」")
+            if self._click_new_chat_in_list():
+                return
+
+        # ---- 策略 2: 在对话详情页 → 按 back 回到对话列表页再新建 ----
+        if in_chat_screen:
+            logger.info("[豆包] 当前在对话详情页，按 back 回对话列表页...")
+            self.driver.back()
+            time.sleep(1)
+            if self._is_in_chat_list():
+                logger.info("[豆包] 已回到对话列表页")
+                if self._click_new_chat_in_list():
+                    return
+            else:
+                logger.debug("[豆包] back 后未到对话列表页，尝试侧边栏...")
+
+        # ---- 策略 3: 侧边栏方式 ----
         sidebar_btns = self.driver.find_elements(
             AppiumBy.ID, self.IDs.SIDEBAR_NEW_CHAT,
         )
         if not sidebar_btns:
-            # 侧边栏没展开，需要先打开
-            # 从对话页点 back_icon 打开侧边栏
             try:
                 back_btn = self.driver.find_elements(
                     AppiumBy.ID, self.IDs.BACK_ICON,
                 )
                 if back_btn:
                     back_btn[0].click()
-                    logger.debug("[豆包] 已点击 back_icon 打开侧边栏")
+                    logger.debug("[豆包] 已点击 back_icon")
                     time.sleep(1.5)
-                else:
-                    # 没有 back_icon，可能不在对话页，用 back 键
-                    for _ in range(3):
-                        self.driver.back()
-                        time.sleep(1)
+
+                    # back_icon 点击后可能回到了对话列表页，检查一下
+                    if self._is_in_chat_list():
+                        logger.info("[豆包] back_icon 后回到对话列表页")
+                        if self._click_new_chat_in_list():
+                            return
+                    else:
                         sidebar_btns = self.driver.find_elements(
                             AppiumBy.ID, self.IDs.SIDEBAR_NEW_CHAT,
                         )
-                        if sidebar_btns:
-                            break
             except Exception as e:
                 logger.warning(f"[豆包] 打开侧边栏失败: {e}")
 
-            # 再次检查
-            sidebar_btns = self.driver.find_elements(
-                AppiumBy.ID, self.IDs.SIDEBAR_NEW_CHAT,
-            )
-
         if sidebar_btns:
             sidebar_btns[0].click()
-            logger.info("[豆包] 已点击「创建新对话」")
+            logger.info("[豆包] 已点击侧边栏「创建新对话」")
             time.sleep(2)
+            logger.info("[豆包] ✅ 新对话窗口已创建（侧边栏方式）")
+            return
 
-            # 验证进入新对话页面
-            try:
-                title_els = self.driver.find_elements(
-                    AppiumBy.ID, self.IDs.TITLE,
+        # ---- 策略 4: Fallback — 连按 back 回到对话列表页再新建 ----
+        logger.warning("[豆包] 策略 1-3 均失败，fallback: 连按 back...")
+        for attempt in range(5):
+            self.driver.back()
+            time.sleep(1.5)
+
+            if self._is_in_chat_list():
+                logger.info(f"[豆包] 已回到对话列表页 (back x{attempt+1})")
+                if self._click_new_chat_in_list():
+                    return
+                break
+
+            # 如果 back 到了对话详情页（有电话图标），也可以直接用
+            if self._is_in_chat_screen():
+                logger.info(
+                    f"[豆包] back 到对话详情页 (back x{attempt+1})，"
+                    f"跳过新建对话直接进通话"
                 )
-                if title_els and "新对话" in (title_els[0].text or ""):
-                    logger.info("[豆包] ✅ 新对话窗口已创建")
-                    return
-                else:
-                    title_text = title_els[0].text if title_els else "N/A"
-                    logger.info(f"[豆包] ✅ 对话窗口已切换 (标题: {title_text})")
-                    return
-            except Exception:
-                pass
+                return
 
-            # 即使验证不到标题，也认为成功（按钮已经点了）
-            logger.info("[豆包] ✅ 新对话窗口已创建（无法验证标题）")
-        else:
-            logger.warning("[豆包] ⚠️ 未找到「创建新对话」按钮，继续使用当前对话")
+        logger.warning("[豆包] ⚠️ 所有策略均失败，继续使用当前对话")
 
     def navigate_to_voice_chat(self):
         """
@@ -514,7 +573,7 @@ class DoubaoBot(BaseBot):
             self.click_element(
                 AppiumBy.ID,
                 self.IDs.PHONE_CONTAINER,
-                timeout=5,
+                timeout=8,
             )
         except Exception:
             try:
@@ -522,7 +581,7 @@ class DoubaoBot(BaseBot):
                 self.click_element(
                     AppiumBy.ACCESSIBILITY_ID,
                     "打电话",
-                    timeout=3,
+                    timeout=5,
                 )
             except Exception:
                 # 方案3: 通过 XPath
@@ -532,13 +591,33 @@ class DoubaoBot(BaseBot):
                     timeout=3,
                 )
 
-        time.sleep(5)  # 等待通话界面加载
+        time.sleep(0.5)  # 基础等待（后面有轮询检测）
 
-        # 验证是否进入通话界面
-        if self._is_in_call_screen():
-            logger.info("[豆包] ✅ 已进入语音通话界面")
+        # 等待通话界面加载（polling，最多等 12s，首轮冷启动可能较慢）
+        call_wait_start = time.time()
+        for _ in range(12):
+            if self._is_in_call_screen():
+                wait_time = time.time() - call_wait_start
+                logger.info(f"[豆包] ✅ 已进入语音通话界面 (等待 {wait_time:.1f}s)")
+                break
+            # 检查并关闭可能的权限弹窗
+            try:
+                allow_btns = self.driver.find_elements(
+                    AppiumBy.XPATH,
+                    '//*[@text="允许" or @text="始终允许" or @text="仅在使用中允许"]',
+                )
+                if allow_btns:
+                    allow_btns[0].click()
+                    logger.info("[豆包] 已点击权限允许按钮")
+                    time.sleep(1)
+                    continue
+            except Exception:
+                pass
+            time.sleep(1)
         else:
-            raise RuntimeError("[豆包] 无法进入语音通话界面")
+            # 12 次都没进入，最后一次检查
+            if not self._is_in_call_screen():
+                raise RuntimeError("[豆包] 无法进入语音通话界面")
 
         # 处理可能的更新弹窗
         self._dismiss_update_dialog()
@@ -583,8 +662,6 @@ class DoubaoBot(BaseBot):
         # 启用字幕（如果还没启用）
         self.enable_subtitle()
 
-        time.sleep(1)
-
         # 拍摄文本 baseline
         self.snapshot_baseline_texts()
 
@@ -616,7 +693,7 @@ class DoubaoBot(BaseBot):
                     # 按返回键退出
                     self.driver.back()
 
-            time.sleep(2)
+            time.sleep(1)
         else:
             logger.debug("[豆包] 不在通话界面，可能已结束")
 

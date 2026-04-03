@@ -84,9 +84,9 @@ APK 文件过大（~538MB），不含在 skill 中。从以下渠道获取并放
 ### 4. 配置 Android 模拟器
 
 ```bash
-# 创建 AVD（API 30, Pixel 6）
+# 创建 AVD（Android 14, API 34, Pixel 6, arm64）
 ~/Library/Android/sdk/cmdline-tools/latest/bin/avdmanager create avd \
-  -n voice_benchmark -k "system-images;android-30;google_apis;x86_64" \
+  -n Pixel_6_API_34 -k "system-images;android-34;google_apis;arm64-v8a" \
   -d "pixel_6"
 
 # macOS 环境配置（一键脚本）
@@ -123,8 +123,10 @@ python3 -m src.runner --inspect doubao
 
 1. **模拟器运行中**（带 gRPC 端口，**不能**加 `-no-audio`）：
    ```bash
-   ~/Library/Android/sdk/emulator/emulator -avd voice_benchmark -no-snapshot-load -grpc 8554
+   ~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load
+   # ⚠️ 必须加 -no-snapshot-load，否则音频 HAL 可能从快照恢复时 I/O error（宿主机听不到声音）
    # ⚠️ 禁止加 -no-audio，否则虚拟麦克风被禁用，APP 收不到注入的语音
+   # ⚠️ 固化版本: Android 14 (API 34), Emulator 36.6.2, arm64-v8a, 1080x2400
    ```
 2. **Appium 运行中**：`appium &`（端口 4723）
 3. **APP 已登录**：豆包和元宝需要手动登录一次
@@ -287,11 +289,30 @@ python3 scripts/test_text_detection.py yuanbao --inject
 
 1. **gRPC 认证**：模拟器必须用 `-grpc 8554` 启动禁用 JWT，否则 injectAudio 会鉴权失败
 2. **禁止 `-no-audio`**：启动模拟器时**绝对不能**加 `-no-audio` 参数。该参数会同时禁用音频输入和输出，导致 gRPC 注入的音频虽然发送成功，但虚拟麦克风被禁用，APP 完全收不到语音，表现为永远卡在 "Listening..."
-3. **通话音频路由（听不到 AI 回复声音）**：语音通话 APP 默认走 `STREAM_VOICE_CALL` → 听筒(earpiece)。模拟器的听筒音频不会路由到宿主机，导致在 Mac 上听不到声音。解决方案：`adb shell content insert --uri content://settings/system --bind name:s:speakerphone_on --bind value:s:1`（已集成到 `base_bot.py` 的 `_setup_audio_routing()` 自动执行）
-4. **waitForIdle 阻塞**：不设 `waitForIdleTimeout=0` 会导致 TTFT 虚高（测到 16-18s 而非 1-2s）
-5. **元宝 Session 崩溃**：连续多轮测试时元宝偶尔 Appium Session 断开。`reset_app()` + 异常恢复可缓解
-6. **字幕 Toggle 反转**：豆包字幕按钮盲点可能关闭字幕。必须先检测 content-desc 再决定是否点击
-7. **Edge TTS 必需**：macOS say 生成的语音 APP 识别不了，必须用 edge-tts
-8. **APP 冷启动卡顿**：`reset_app()` 后 APP 表面加载了但语音通话通道未建立。必须有 UI 就绪验证 + AI 问候等待，不能纯 sleep
-9. **AI 主动问候干扰注入**：豆包新建对话后常主动打招呼，此时注入音频会被 VAD 丢弃。必须等 AI 问候结束后再注入
-10. **模拟器长时间运行音频管道失效**：模拟器连续运行 48+ 小时后，gRPC 音频注入虽然显示成功，但 APP 无法识别语音。需要重启模拟器恢复
+3. **⚠️ Mac 无麦克风致模拟器崩溃（最隐蔽的坑）**：Mac mini / Mac Studio 等**没有内置麦克风**的机型上，调用 gRPC `injectAudio()` 会导致**模拟器直接 crash**。根因是模拟器虚拟麦克风 ADC 初始化时需要宿主机有音频输入设备，否则失败。日志特征：`Could not initialize record - Unknown Audiodevice` + `Failed to create voice 'adc'`。**解决方案**：安装 [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole) 虚拟音频驱动，让 macOS 系统有一个虚拟音频输入设备：
+   ```bash
+   brew install blackhole-2ch
+   # 安装后必须重启 Core Audio 服务
+   sudo killall -9 coreaudiod
+   # coreaudiod 会自动重启，等 2-3 秒即可
+   # 验证：系统偏好设置 → 声音 → 输入，应能看到 "BlackHole 2ch"
+   ```
+   **注意**：不需要在「音频 MIDI 设置」中做任何聚合设备配置，只要 BlackHole 2ch 驱动安装即可。`setup_mac.sh` 已包含此步骤的自动安装。
+4. **通话音频路由（听不到 AI 回复声音）**：语音通话 APP 默认走 `STREAM_VOICE_CALL` → 听筒(earpiece)。模拟器的听筒音频不会路由到宿主机，导致在 Mac 上听不到声音。解决方案：`adb shell content insert --uri content://settings/system --bind name:s:speakerphone_on --bind value:s:1`（已集成到 `base_bot.py` 的 `_setup_audio_routing()` 自动执行）
+5. **waitForIdle 阻塞**：不设 `waitForIdleTimeout=0` 会导致 TTFT 虚高（测到 16-18s 而非 1-2s）
+6. **元宝 Session 崩溃**：连续多轮测试时元宝偶尔 Appium Session 断开。`reset_app()` + 异常恢复可缓解
+7. **字幕 Toggle 反转**：豆包字幕按钮盲点可能关闭字幕。必须先检测 content-desc 再决定是否点击
+8. **Edge TTS 必需**：macOS say 生成的语音 APP 识别不了，必须用 edge-tts
+9. **APP 冷启动卡顿**：`reset_app()` 后 APP 表面加载了但语音通话通道未建立。必须有 UI 就绪验证 + AI 问候等待，不能纯 sleep
+10. **AI 主动问候干扰注入**：豆包新建对话后常主动打招呼，此时注入音频会被 VAD 丢弃。必须等 AI 问候结束后再注入
+11. **模拟器长时间运行音频管道失效**：模拟器连续运行 48+ 小时后，gRPC 音频注入虽然显示成功，但 APP 无法识别语音。需要重启模拟器恢复
+12. **⚠️ 音频 HAL pcm_writei I/O error（宿主机听不到声音）**：模拟器从快照恢复或启动时宿主机音频设备状态异常，会导致音频 HAL `android.hardware.audio@7.1-impl.ranchu` 持续报 `pcm_writei failed with 'I/O error'`，表现为 gRPC `streamAudio` 返回 0 字节、宿主机完全听不到模拟器声音。**解决方案**：必须用 `-no-snapshot-load` 冷启动模拟器确保音频 HAL 干净初始化：
+   ```bash
+   # 1. 关闭当前模拟器
+   adb emu kill
+   # 2. 等待完全关闭
+   sleep 5
+   # 3. 冷启动（关键：-no-snapshot-load）
+   ~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load
+   ```
+   **诊断方法**：`adb shell "logcat -d | grep pcm_writei"` 如果有 I/O error 就说明需要冷启动

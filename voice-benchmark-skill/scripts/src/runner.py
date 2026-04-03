@@ -93,7 +93,7 @@ class BenchmarkRunner:
         else:
             raise ValueError(f"未知的测试目标: {target}")
 
-    def _wait_for_ai_greeting_done(self, target: str, bot, max_wait: float = 12.0) -> float:
+    def _wait_for_ai_greeting_done(self, target: str, bot, max_wait: float = 8.0) -> float:
         """等待 AI 主动问候结束
 
         豆包进入通话后经常主动打招呼（"你好呀！有什么想聊的？"），
@@ -110,7 +110,7 @@ class BenchmarkRunner:
 
         t_start = time.time()
         ai_was_speaking = False
-        poll_interval = 0.3
+        poll_interval = 0.15  # 150ms 轮询（快速检测 AI 问候结束）
 
         for _ in range(int(max_wait / poll_interval)):
             status = bot._get_call_status_fast()
@@ -124,8 +124,8 @@ class BenchmarkRunner:
             # AI 说完了
             if ai_was_speaking and ("正在听" in status or "你可以开始说话" in status):
                 wait_time = time.time() - t_start
-                # 额外等 0.5s 让音频管道完全切换到接收模式
-                time.sleep(0.5)
+                # 短暂等待让音频管道完全切换到接收模式
+                time.sleep(0.3)
                 return wait_time
 
             time.sleep(poll_interval)
@@ -207,6 +207,9 @@ class BenchmarkRunner:
         当 Appium session 崩溃（InvalidSessionIdException）时调用。
         断开旧 session → 重新连接 → 验证。
 
+        使用 skip_reinstall=True 跳过 UiAutomator2/Settings APK 重装，
+        避免重装触发 force-stop 引起的 race condition。
+
         Returns:
             True = 恢复成功, False = 恢复失败
         """
@@ -221,8 +224,8 @@ class BenchmarkRunner:
 
             time.sleep(3)
 
-            # 重新建立 session
-            bot.connect()
+            # 重新建立 session（跳过 APK 重装防止 race condition）
+            bot.connect(skip_reinstall=True)
 
             # 验证：尝试获取 page_source
             source = bot.driver.page_source
@@ -318,11 +321,15 @@ class BenchmarkRunner:
         try:
             # 1. 导航到语音通话
             bot.navigate_to_voice_chat()
-            time.sleep(2)
+            time.sleep(0.5)
 
             # 2. 开始通话（内部会拍摄文本 baseline）
             call_start = bot.start_voice_call()
-            time.sleep(2)
+            time.sleep(0.5)
+
+            # 2.1 通话已建立，设置通话中音频路由（扬声器 + 通话音量最大）
+            #     必须在通话模式建立后调用，否则通话流音量设置不生效
+            bot._setup_incall_audio()
 
             # 2.5 等待 AI 主动问候结束（豆包进入通话后常会主动打招呼）
             #     如果在 AI 说话时注入音频，会被当噪音丢弃
@@ -345,6 +352,13 @@ class BenchmarkRunner:
 
             # 4. 通过 gRPC 注入测试问题音频
             self._ensure_injector()
+
+            # 确保 incall_audio 后台设置已完成
+            if hasattr(bot, '_incall_audio_proc') and bot._incall_audio_proc:
+                bot._incall_audio_proc.wait(timeout=10)
+                bot._incall_audio_proc = None
+                logger.debug("通话中音频设置已完成")
+
             question_path = self._get_question_audio_path()
             # 动态获取音频时长
             import wave
@@ -529,9 +543,9 @@ class BenchmarkRunner:
                 pass
 
             # 7. 结束通话
-            time.sleep(2)
+            time.sleep(1)
             bot.end_voice_call()
-            time.sleep(2)
+            time.sleep(1)
 
             return result
 

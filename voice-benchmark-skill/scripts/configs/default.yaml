@@ -5,10 +5,16 @@ node_id: "auto"
 node_region: "cn-shenzhen"
 
 # 设备配置
+# ⚠️ 固化版本 (2026-04-03)：
+#   模拟器: Android Emulator 36.6.2 (build 15098414)
+#   AVD: Pixel_6_API_34, Android 14 (API 34), google_apis, arm64-v8a
+#   系统镜像: sdk_gphone64_arm64, build UE1A.230829.036.A4
+#   分辨率: 1080x2400
 device:
   platform: "Android"
   device_name: "emulator-5554"
-  platform_version: "11"
+  platform_version: "14"
+  avd_name: "Pixel_6_API_34"
   automation_name: "UiAutomator2"
   appium_host: "127.0.0.1"
   appium_port: 4723
@@ -34,7 +40,7 @@ benchmark:
     - csv
     - html
 
-# APP 配置 (基于 2026-03-30 Appium Inspector 校准)
+# APP 配置 (基于 2026-04-03 Android 14 Pixel_6_API_34 校准)
 apps:
   yuanbao:
     package: "com.tencent.hunyuan.app.chat"

@@ -21,9 +21,13 @@ chmod +x scripts/setup_mac.sh
 
 ### 2. 准备设备
 
+> ⚠️ **Mac mini/Mac Studio 用户必读**：这些机型没有内置麦克风，gRPC `injectAudio` 会导致模拟器直接崩溃。
+> 必须先安装 BlackHole 2ch 虚拟音频驱动：`brew install blackhole-2ch && sudo killall -9 coreaudiod`
+> `setup_mac.sh` 已包含此步骤。
+
 ```bash
-# 启动 Android 模拟器
-emulator -avd voice_benchmark &
+# 启动 Android 模拟器（必须加 -no-snapshot-load 确保音频 HAL 正常初始化）
+emulator -avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load &
 
 # 安装 APP
 adb install yuanbao.apk

@@ -27,8 +27,15 @@ class BaseBot(ABC):
         self.driver: Optional[webdriver.Remote] = None
         self._is_connected = False
 
-    def connect(self):
-        """连接到 Appium 服务器并启动 APP"""
+    def connect(self, skip_reinstall: bool = False):
+        """连接到 Appium 服务器并启动 APP
+
+        Args:
+            skip_reinstall: 是否跳过 UiAutomator2 server 和 io.appium.settings
+                           APK 的重新安装。首次连接传 False（默认），session 重建时
+                           传 True 以避免重装 APK 触发 force-stop 导致 race condition
+                           （新 UiAutomator2 server 在 session "就绪" 后被延迟杀死）。
+        """
         options = UiAutomator2Options()
         options.platform_name = self.device_config.platform
         options.device_name = self.device_config.device_name
@@ -47,6 +54,15 @@ class BaseBot(ABC):
         options.set_capability("waitForIdleTimeout", 0)
         options.set_capability("waitForSelectorTimeout", 0)
 
+        if skip_reinstall:
+            # 🔑 跳过 APK 重装，防止 Appium 在 session 创建时重新安装
+            # io.appium.settings 和 io.appium.uiautomator2.server APK，
+            # 避免 installPackageLI → Force Stop → UiAutomator2 被杀的 race condition。
+            # 前提：APK 已经在设备上（首次连接时已安装）。
+            options.set_capability("skipServerInstallation", True)
+            options.set_capability("skipDeviceInitialization", True)
+            logger.info("跳过 UiAutomator2/Settings APK 重装（防 race condition）")
+
         appium_url = (
             f"http://{self.device_config.appium_host}:"
             f"{self.device_config.appium_port}"
@@ -63,6 +79,26 @@ class BaseBot(ABC):
         self._is_connected = True
         logger.info(f"已连接到 {self.app_config.name}")
 
+        # 🔑 Post-connect 稳定性验证
+        # Appium 创建 session 时会重装 APK（除非 skipServerInstallation），
+        # 重装完成后可能有延迟的 force-stop 操作杀掉 UiAutomator2 server，
+        # 这里做两轮验证（间隔 2s）确保 UiAutomator2 真正稳定。
+        if not skip_reinstall:
+            for check in range(2):
+                time.sleep(2)
+                try:
+                    source = self.driver.page_source
+                    if source and len(source) > 100:
+                        continue
+                except Exception as e:
+                    logger.warning(
+                        f"Post-connect 验证 #{check+1} 失败: "
+                        f"{str(e)[:80]}，等待恢复..."
+                    )
+                    time.sleep(3)
+                    # 最后一次验证还失败就算了，让调用方处理
+            logger.debug("UiAutomator2 post-connect 稳定性验证通过")
+
         # 设置音频路由：通话音频切到扬声器外放
         self._setup_audio_routing()
 
@@ -70,17 +106,34 @@ class BaseBot(ABC):
         time.sleep(self.app_config.post_login_wait)
 
     def _setup_audio_routing(self):
-        """设置模拟器音频路由
+        """设置模拟器音频路由（启动时调用）
 
-        语音通话类 APP 默认走 STREAM_VOICE_CALL → 听筒(earpiece)。
-        Android 模拟器的听筒音频不会路由到宿主机音频输出，导致听不到声音。
-        必须强制切到扬声器(speaker)模式。
+        精确设置非通话音频流的音量到最大。
+        VOICE_CALL 流在非通话模式下无法修改（Android 安全限制），
+        需要在通话建立后由 _setup_incall_audio() 处理。
 
-        同时拉满音量确保音频可听。
+        Android 音频流及其用途:
+        - stream 0: VOICE_CALL — 语音通话（只能在通话模式下修改）
+        - stream 1: SYSTEM    — 系统提示音
+        - stream 2: RING      — 铃声
+        - stream 3: MUSIC     — 媒体播放（元宝用这个流）
+        - stream 4: ALARM     — 闹钟
+        - stream 5: NOTIFICATION — 通知
         """
         device = self.device_config.device_name
         try:
-            # 强制开启扬声器模式（通话音频从听筒切到外放）
+            # 批次1: 设置非通话音频流音量到最大（合并成一条 shell 命令）
+            subprocess.run(
+                ["adb", "-s", device, "shell",
+                 "cmd media_session volume --stream 1 --set 7; "   # SYSTEM
+                 "cmd media_session volume --stream 2 --set 7; "   # RING
+                 "cmd media_session volume --stream 3 --set 15; "  # MUSIC
+                 "cmd media_session volume --stream 4 --set 7; "   # ALARM
+                 "cmd media_session volume --stream 5 --set 7"],   # NOTIFICATION
+                capture_output=True, timeout=10,
+            )
+
+            # 批次2: 写入扬声器偏好（系统级）
             subprocess.run(
                 ["adb", "-s", device, "shell", "content", "insert",
                  "--uri", "content://settings/system",
@@ -88,16 +141,37 @@ class BaseBot(ABC):
                  "--bind", "value:s:1"],
                 capture_output=True, timeout=5,
             )
-            # 拉满音量（按 15 次 VOLUME_UP 确保各种音频流都最大）
-            for _ in range(15):
-                subprocess.run(
-                    ["adb", "-s", device, "shell", "input", "keyevent",
-                     "KEYCODE_VOLUME_UP"],
-                    capture_output=True, timeout=3,
-                )
-            logger.info("音频路由已设置: 扬声器模式 + 音量最大")
+
+            logger.info("音频路由已设置: 非通话流音量最大 + 扬声器偏好")
         except Exception as e:
             logger.warning(f"音频路由设置失败(不影响测试): {e}")
+
+    def _setup_incall_audio(self):
+        """设置通话中的音频路由（进入通话界面后调用，后台执行不阻塞）
+
+        关键时序：必须在 APP 已经进入通话模式后调用。
+        此时 Android 的音频模式为 MODE_IN_COMMUNICATION，
+        VOLUME_UP 按键会影响 STREAM_VOICE_CALL 流。
+
+        使用 Popen 后台执行，不阻塞主流程（与 AI 问候等待并行）。
+        """
+        device = self.device_config.device_name
+        try:
+            # 全部合并成一条 shell 命令，后台执行
+            self._incall_audio_proc = subprocess.Popen(
+                ["adb", "-s", device, "shell",
+                 "content insert --uri content://settings/system "
+                 "--bind name:s:speakerphone_on --bind value:s:1; "
+                 "input keyevent KEYCODE_VOLUME_UP KEYCODE_VOLUME_UP "
+                 "KEYCODE_VOLUME_UP KEYCODE_VOLUME_UP KEYCODE_VOLUME_UP "
+                 "KEYCODE_VOLUME_UP KEYCODE_VOLUME_UP; "
+                 "cmd media_session volume --stream 0 --set 5; "
+                 "cmd media_session volume --stream 3 --set 15"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            logger.info("通话中音频设置已启动（后台执行）")
+        except Exception as e:
+            logger.warning(f"通话中音频设置失败(不影响测试): {e}")
 
     def disconnect(self):
         """断开连接"""
@@ -151,23 +225,34 @@ class BaseBot(ABC):
         """强杀 APP 并冷启动，清除所有运行时上下文
 
         用于保证每轮 benchmark 都是全新对话，没有历史上下文给 AI 做热缓存。
-        流程: force-stop → 等待进程退出 → 冷启动 → UI 就绪验证
+        流程: terminate → 等待进程退出 → 冷启动 → UiAutomator2 健康检查
         """
         pkg = self.app_config.package
         device = self.device_config.device_name
         logger.info(f"[{self.app_config.name}] 强杀 APP 并冷启动...")
 
-        # 1. force-stop 杀掉 APP（清除进程和临时状态）
+        # 1. 优先用 Appium terminate_app（保留 UiAutomator2 instrumentation）
+        #    如果失败再降级为 ADB force-stop
+        terminated_via_appium = False
         try:
-            subprocess.run(
-                ["adb", "-s", device, "shell", "am", "force-stop", pkg],
-                capture_output=True, timeout=10,
-            )
-            logger.debug(f"  force-stop {pkg} 完成")
+            if self.driver:
+                self.driver.terminate_app(pkg)
+                terminated_via_appium = True
+                logger.debug(f"  terminate_app {pkg} 完成 (Appium)")
         except Exception as e:
-            logger.warning(f"  force-stop 失败: {e}")
+            logger.debug(f"  terminate_app 失败: {e}，降级为 force-stop")
 
-        time.sleep(3)
+        if not terminated_via_appium:
+            try:
+                subprocess.run(
+                    ["adb", "-s", device, "shell", "am", "force-stop", pkg],
+                    capture_output=True, timeout=10,
+                )
+                logger.debug(f"  force-stop {pkg} 完成 (ADB)")
+            except Exception as e:
+                logger.warning(f"  force-stop 失败: {e}")
+
+        time.sleep(1)
 
         # 2. 冷启动 APP
         try:
@@ -184,25 +269,59 @@ class BaseBot(ABC):
             except Exception as e:
                 logger.warning(f"  ADB 启动失败: {e}")
 
-        # 3. 等待 APP 完全加载（基础等待 + UI 就绪验证）
-        base_wait = self.app_config.post_login_wait + 3
+        # 3. 等待 APP 完全加载
+        base_wait = self.app_config.post_login_wait + 1
         logger.debug(f"  基础等待 {base_wait}s...")
         time.sleep(base_wait)
 
-        # 4. UI 就绪验证：尝试找到 APP 主界面元素（最多再等 10s）
+        # 4. UiAutomator2 健康检查 + 自愈
+        #    force-stop 会连带杀死 UiAutomator2 instrumentation 进程，
+        #    导致下一轮 find_elements 必崩。这里提前检测并修复。
         if self.driver:
+            ui2_healthy = False
             t_verify_start = time.time()
-            for _ in range(20):
+            for attempt in range(3):
                 try:
-                    # 尝试获取 page_source，如果 UiAutomator2 就绪则秒回
                     source = self.driver.page_source
                     if source and len(source) > 100:
                         verify_time = time.time() - t_verify_start
-                        logger.debug(f"  UI 就绪验证通过 ({verify_time:.1f}s)")
+                        logger.debug(f"  UiAutomator2 就绪 ({verify_time:.1f}s)")
+                        ui2_healthy = True
                         break
-                except Exception:
-                    pass
-                time.sleep(0.5)
+                except Exception as e:
+                    err_msg = str(e)
+                    if ("instrumentation" in err_msg.lower()
+                            or "cannot be proxied" in err_msg.lower()
+                            or "not running" in err_msg.lower()):
+                        logger.warning(
+                            f"  UiAutomator2 崩溃 (检测 #{attempt+1})，"
+                            f"主动重建 session..."
+                        )
+                        # 主动重建 session（不等到下一轮崩溃再救）
+                        try:
+                            self.disconnect()
+                        except Exception:
+                            pass
+                        time.sleep(2)
+                        try:
+                            self.connect(skip_reinstall=True)
+                            ui2_healthy = True
+                            logger.info(
+                                f"  ✅ Session 主动重建成功 "
+                                f"({time.time() - t_verify_start:.1f}s)"
+                            )
+                            break
+                        except Exception as ce:
+                            logger.error(f"  Session 主动重建失败: {ce}")
+                    else:
+                        logger.debug(f"  page_source 异常: {err_msg[:60]}")
+                time.sleep(1)
+
+            if not ui2_healthy:
+                logger.warning(
+                    f"[{self.app_config.name}] ⚠️ UiAutomator2 健康检查未通过，"
+                    f"下一轮可能触发 session 恢复"
+                )
 
         logger.info(f"[{self.app_config.name}] APP 已冷启动完成")
 

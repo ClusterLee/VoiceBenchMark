@@ -34,22 +34,22 @@ from .base_bot import BaseBot
 from ..config import AppConfig, DeviceConfig
 
 
-# 元宝 UI 坐标常量（屏幕 1080x2400, Android 11 Pixel 6）
+# 元宝 UI 坐标常量（屏幕 1080x2400, Android 14 Pixel 6 API 34）
 class YuanbaoCoords:
     """元宝 UI 元素坐标"""
     # 主界面
-    PHONE_ICON = (857, 152)          # 电话图标 [794,89][920,215]
-    MUTE_ICON = (734, 152)           # 静音图标 [673,89][794,215]
-    SCAN_ICON = (978, 152)           # 扫描图标 [951,127][1004,177]
+    PHONE_ICON = (857, 217)          # 电话图标 [794,154][920,280]
+    MUTE_ICON = (734, 217)           # 静音图标 [673,154][794,280]
+    SCAN_ICON = (978, 217)           # 扫描图标 [951,192][1004,242]
 
-    # 通话界面底部按钮
-    CALL_CAMERA = (147, 2085)        # 摄像头 [63,2001][231,2169]
-    CALL_MIC = (409, 2085)           # 麦克风 [325,2001][493,2169]
-    CALL_TEXT = (671, 2085)          # 文字输入 [587,2001][755,2169]
-    CALL_HANGUP = (933, 2085)        # 挂断 [849,2001][1017,2169]
+    # 通话界面底部按钮 (Android 14 Pixel 6 API 34)
+    CALL_CAMERA = (147, 2148)        # 摄像头 [63,2064][231,2232]
+    CALL_MIC = (409, 2148)           # 麦克风 [325,2064][493,2232]
+    CALL_TEXT = (671, 2148)          # 文字输入 [587,2064][755,2232]
+    CALL_HANGUP = (933, 2148)        # 挂断 [849,2064][1017,2232]
 
     # Enable 麦克风按钮
-    ENABLE_MIC = (874, 1896)         # [806,1833][941,1959]
+    ENABLE_MIC = (873, 1959)         # [806,1896][941,2022]
 
 
 # 元宝通话界面的固定/系统文案（这些不是 AI 回复内容）
@@ -405,7 +405,7 @@ class YuanbaoBot(BaseBot):
         """确保元宝 APP 在前台"""
         try:
             self.driver.activate_app(self.app_config.package)
-            time.sleep(3)
+            time.sleep(1)
             logger.info("[元宝] APP 已激活到前台")
         except Exception as e:
             logger.warning(f"[元宝] activate_app 失败: {e}，尝试用 ADB...")
@@ -416,7 +416,7 @@ class YuanbaoBot(BaseBot):
                      f"{self.app_config.package}/{self.app_config.activity}"],
                     capture_output=True, timeout=10
                 )
-                time.sleep(3)
+                time.sleep(1)
             except Exception:
                 pass
 
@@ -446,7 +446,7 @@ class YuanbaoBot(BaseBot):
             except Exception:
                 # 用坐标点击 Exit 按钮位置
                 self._tap(341, 1305, "Exit")
-            time.sleep(3)
+            time.sleep(1)
             logger.info("[元宝] 已关闭断开弹窗")
         except Exception:
             pass
@@ -489,20 +489,26 @@ class YuanbaoBot(BaseBot):
                     '//android.widget.TextView[@text="Chat"]',
                     timeout=5,
                 )
-                time.sleep(2)
+                time.sleep(1)
             except Exception:
                 logger.debug("[元宝] Chat tab 未找到，可能已在主界面")
 
-        time.sleep(2)
+        time.sleep(0.5)
 
         # 点击右上角电话图标进入语音通话
         logger.info("[元宝] 点击电话图标...")
         self._tap(*YuanbaoCoords.PHONE_ICON, "电话图标")
-        time.sleep(6)
 
-        if self._is_in_call_screen():
-            logger.info("[元宝] ✅ 已进入语音通话界面")
-        else:
+        # 轮询等待进入通话界面（最多 8s，替代固定 6s sleep）
+        entered = False
+        for wait_i in range(16):
+            time.sleep(0.5)
+            if self._is_in_call_screen():
+                entered = True
+                logger.info(f"[元宝] ✅ 已进入语音通话界面 (等待 {(wait_i+1)*0.5:.1f}s)")
+                break
+
+        if not entered:
             logger.warning("[元宝] 第一次点击未生效，重试...")
             from selenium.webdriver.common.action_chains import ActionChains
             from selenium.webdriver.common.actions import interaction
@@ -522,9 +528,15 @@ class YuanbaoBot(BaseBot):
             actions.w3c_actions.pointer_action.release()
             actions.perform()
 
-            time.sleep(6)
+            # 轮询等待重试后进入通话界面（最多 8s）
+            for wait_i in range(16):
+                time.sleep(0.5)
+                if self._is_in_call_screen():
+                    entered = True
+                    logger.info(f"[元宝] ✅ 重试后进入通话界面 (等待 {(wait_i+1)*0.5:.1f}s)")
+                    break
 
-            if not self._is_in_call_screen():
+            if not entered:
                 raise RuntimeError("[元宝] 无法进入语音通话界面")
 
         self._handle_mic_permission()
@@ -574,7 +586,7 @@ class YuanbaoBot(BaseBot):
         logger.info("[元宝] 开始语音通话...")
 
         # 通话已在 navigate_to_voice_chat 中自动开始
-        time.sleep(2)
+        time.sleep(1)
 
         # 拍摄文本 baseline（在注入音频之前）
         self.snapshot_baseline_texts()
@@ -589,7 +601,7 @@ class YuanbaoBot(BaseBot):
 
         if self._is_in_call_screen():
             self._tap(*YuanbaoCoords.CALL_HANGUP, "挂断")
-            time.sleep(2)
+            time.sleep(1)
         else:
             logger.debug("[元宝] 不在通话界面，可能已结束")
 

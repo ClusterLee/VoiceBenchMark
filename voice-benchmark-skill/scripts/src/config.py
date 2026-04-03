@@ -87,6 +87,7 @@ class DeviceConfig:
     platform: str = "Android"
     device_name: str = "emulator-5554"
     platform_version: str = "14"
+    avd_name: str = "Pixel_6_API_34"
     # ADB
     adb_host: Optional[str] = None  # 远程 ADB 时使用
     adb_port: int = 5037
@@ -135,7 +136,7 @@ class Config:
     def default(cls) -> "Config":
         """默认配置"""
         config = cls()
-        config.device.platform_version = "11"
+        config.device.platform_version = "14"
         config.apps = {
             "yuanbao": AppConfig(
                 name="yuanbao",

@@ -103,7 +103,7 @@ EmulatorMicInjector 通过 Android 模拟器 gRPC `injectAudio()` API 注入音�
 
 **关键参数**：
 - `grpc_host`: localhost
-- `grpc_port`: 8554（模拟器需 `-grpc 8554` 启动）
+- `grpc_port`: 8554（模拟器需 `-grpc 8554 -no-snapshot-load` 启动）
 - `chunk_ms`: 20（实时节奏控制精度）
 
 ## Config Hierarchy
@@ -116,7 +116,7 @@ node_region: "local"
 device:
   platform: "Android"
   device_name: "emulator-5554"
-  platform_version: "11"
+  platform_version: "14"
   automation_name: "UiAutomator2"
   appium_host: "127.0.0.1"
   appium_port: 4723
