@@ -21,7 +21,7 @@ device:
 
 # 音频配置
 audio:
-  input_file: "assets/audio/hello_nihao_edge_48k.wav"  # Edge TTS 48kHz "您好"
+  input_file: "assets/audio/math_question_edge_48k.wav"  # Edge TTS 48kHz "1+1等于几"
   sample_rate: 16000
   vad_aggressiveness: 2
   vad_frame_duration_ms: 30

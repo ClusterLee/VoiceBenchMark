@@ -13,10 +13,15 @@ import os
 import sys
 import time
 import json
+import shutil
+import signal
+import subprocess
 import click
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
+from urllib.request import urlopen
+from urllib.error import URLError
 from loguru import logger
 
 # 将 src 加入 path
@@ -92,6 +97,276 @@ class BenchmarkRunner:
             return DoubaoBot(device_config, app_config)
         else:
             raise ValueError(f"未知的测试目标: {target}")
+
+    # ── 环境预检 ──────────────────────────────────────────
+
+    @staticmethod
+    def _find_adb() -> str:
+        """查找 adb 可执行路径"""
+        # 优先 PATH 中的 adb
+        adb = shutil.which("adb")
+        if adb:
+            return adb
+        # 常见 macOS 路径
+        for candidate in [
+            os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
+            "/usr/local/bin/adb",
+        ]:
+            if os.path.isfile(candidate):
+                return candidate
+        return "adb"  # fallback，让调用方报错
+
+    @staticmethod
+    def _find_emulator() -> str:
+        """查找 emulator 可执行路径"""
+        emu = shutil.which("emulator")
+        if emu:
+            return emu
+        candidate = os.path.expanduser(
+            "~/Library/Android/sdk/emulator/emulator"
+        )
+        if os.path.isfile(candidate):
+            return candidate
+        return "emulator"
+
+    @staticmethod
+    def _find_appium() -> str:
+        """查找 appium 可执行路径"""
+        appium = shutil.which("appium")
+        if appium:
+            return appium
+        # managed Node 环境
+        candidate = os.path.expanduser(
+            "~/.workbuddy/binaries/node/workspace/node_modules/.bin/appium"
+        )
+        if os.path.isfile(candidate):
+            return candidate
+        return "appium"
+
+    @staticmethod
+    def _is_appium_running(host: str = "127.0.0.1", port: int = 4723) -> bool:
+        """检查 Appium 是否在运行"""
+        try:
+            resp = urlopen(f"http://{host}:{port}/status", timeout=3)
+            return resp.status == 200
+        except Exception:
+            return False
+
+    @classmethod
+    def _is_emulator_running(cls) -> bool:
+        """检查 Android 模拟器是否在运行"""
+        adb = cls._find_adb()
+        try:
+            result = subprocess.run(
+                [adb, "devices"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return "emulator-" in result.stdout
+        except Exception:
+            return False
+
+    @classmethod
+    def _is_emulator_booted(cls) -> bool:
+        """检查模拟器是否已完全启动"""
+        adb = cls._find_adb()
+        try:
+            result = subprocess.run(
+                [adb, "-s", "emulator-5554", "shell",
+                 "getprop", "sys.boot_completed"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.stdout.strip() == "1"
+        except Exception:
+            return False
+
+    @classmethod
+    def _start_emulator(cls, avd_name: str = "Pixel_6_API_34",
+                        grpc_port: int = 8554,
+                        timeout: float = 120.0) -> bool:
+        """启动 Android 模拟器并等待 boot 完成
+
+        Args:
+            avd_name: AVD 名称
+            grpc_port: gRPC 端口
+            timeout: 最大等待时间（秒）
+
+        Returns:
+            True = 启动成功, False = 超时/失败
+        """
+        emu = cls._find_emulator()
+        logger.info(
+            f"🚀 [Preflight] 启动模拟器: {emu} -avd {avd_name} "
+            f"-grpc {grpc_port} -no-snapshot-load"
+        )
+
+        # 设置环境变量（确保 Android SDK 工具链可用）
+        env = os.environ.copy()
+        android_home = os.path.expanduser("~/Library/Android/sdk")
+        if os.path.isdir(android_home):
+            env["ANDROID_HOME"] = android_home
+            env["PATH"] = (
+                f"{android_home}/emulator:{android_home}/platform-tools:"
+                + env.get("PATH", "")
+            )
+
+        try:
+            subprocess.Popen(
+                [emu, "-avd", avd_name,
+                 "-grpc", str(grpc_port),
+                 "-no-snapshot-load"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except FileNotFoundError:
+            logger.error(f"❌ [Preflight] 找不到 emulator: {emu}")
+            return False
+
+        # 等待 boot_completed
+        t_start = time.time()
+        poll_interval = 5.0
+        while time.time() - t_start < timeout:
+            if cls._is_emulator_running() and cls._is_emulator_booted():
+                elapsed = time.time() - t_start
+                logger.info(
+                    f"✅ [Preflight] 模拟器已启动 ({elapsed:.0f}s)"
+                )
+                return True
+            time.sleep(poll_interval)
+
+        logger.error(
+            f"❌ [Preflight] 模拟器启动超时 ({timeout}s)"
+        )
+        return False
+
+    @classmethod
+    def _start_appium(cls, host: str = "127.0.0.1", port: int = 4723,
+                      timeout: float = 30.0) -> bool:
+        """启动 Appium 服务器
+
+        Returns:
+            True = 启动成功, False = 超时/失败
+        """
+        appium = cls._find_appium()
+        logger.info(
+            f"🚀 [Preflight] 启动 Appium: {appium} "
+            f"--address {host} --port {port}"
+        )
+
+        # 确保 managed Node 在 PATH 中
+        env = os.environ.copy()
+        node_bin = os.path.expanduser(
+            "~/.workbuddy/binaries/node/versions/22.12.0/bin"
+        )
+        if os.path.isdir(node_bin):
+            env["PATH"] = node_bin + ":" + env.get("PATH", "")
+
+        # 也添加 Android SDK 工具
+        android_home = os.path.expanduser("~/Library/Android/sdk")
+        if os.path.isdir(android_home):
+            env["ANDROID_HOME"] = android_home
+            env["PATH"] = (
+                f"{android_home}/platform-tools:{android_home}/emulator:"
+                + env["PATH"]
+            )
+
+        try:
+            subprocess.Popen(
+                [appium, "--address", host,
+                 "--port", str(port),
+                 "--relaxed-security"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except FileNotFoundError:
+            logger.error(f"❌ [Preflight] 找不到 appium: {appium}")
+            return False
+
+        # 等待 Appium 就绪
+        t_start = time.time()
+        poll_interval = 2.0
+        while time.time() - t_start < timeout:
+            if cls._is_appium_running(host, port):
+                elapsed = time.time() - t_start
+                logger.info(
+                    f"✅ [Preflight] Appium 已启动 ({elapsed:.0f}s)"
+                )
+                return True
+            time.sleep(poll_interval)
+
+        logger.error(
+            f"❌ [Preflight] Appium 启动超时 ({timeout}s)"
+        )
+        return False
+
+    def preflight_check(self) -> bool:
+        """环境预检：确保模拟器和 Appium 都在运行
+
+        自动检测并按需启动缺失的服务。
+
+        Returns:
+            True = 环境就绪, False = 无法恢复
+        """
+        logger.info("🔍 [Preflight] 环境预检开始...")
+        all_ok = True
+
+        # 1. 检查模拟器
+        if self._is_emulator_running():
+            if self._is_emulator_booted():
+                logger.info("✅ [Preflight] 模拟器运行中且已启动完成")
+            else:
+                logger.info("⏳ [Preflight] 模拟器运行中，等待启动完成...")
+                for _ in range(24):  # 最多等 120s
+                    if self._is_emulator_booted():
+                        break
+                    time.sleep(5)
+                if self._is_emulator_booted():
+                    logger.info("✅ [Preflight] 模拟器启动完成")
+                else:
+                    logger.error("❌ [Preflight] 模拟器启动超时")
+                    all_ok = False
+        else:
+            logger.warning("⚠️ [Preflight] 模拟器未运行，尝试自动启动...")
+            avd = getattr(self.config.device, 'avd_name', 'Pixel_6_API_34')
+            if not self._start_emulator(avd_name=avd):
+                all_ok = False
+
+        # 2. 检查 Appium
+        host = self.config.device.appium_host
+        port = self.config.device.appium_port
+        if self._is_appium_running(host, port):
+            logger.info("✅ [Preflight] Appium 运行中")
+        else:
+            logger.warning("⚠️ [Preflight] Appium 未运行，尝试自动启动...")
+            if not self._start_appium(host, port):
+                all_ok = False
+
+        # 3. 检查 gRPC 端口（仅告警，不阻断）
+        import socket
+        grpc_port = (
+            self.config.device.grpc_port
+            if hasattr(self.config.device, 'grpc_port')
+            else 8554
+        )
+        try:
+            sock = socket.create_connection(
+                ("localhost", grpc_port), timeout=2
+            )
+            sock.close()
+            logger.info(f"✅ [Preflight] gRPC 端口 {grpc_port} 可用")
+        except Exception:
+            logger.warning(
+                f"⚠️ [Preflight] gRPC 端口 {grpc_port} 未开放，"
+                f"音频注入可能失败"
+            )
+
+        if all_ok:
+            logger.info("✅ [Preflight] 环境预检通过")
+        else:
+            logger.error("❌ [Preflight] 环境预检未通过，测试可能失败")
+
+        return all_ok
 
     def _wait_for_ai_greeting_done(self, target: str, bot, max_wait: float = 8.0) -> float:
         """等待 AI 主动问候结束
@@ -255,21 +530,13 @@ class BenchmarkRunner:
     def _get_question_audio_path(self) -> str:
         """获取测试问题音频文件路径
 
-        优先使用 Edge TTS 生成的高质量 48kHz 中文语音。
-        当前问题: "您好" (约 1.63 秒)
-        使用简单问候语避免元宝在回复复杂问题时播放"思考音效"，
-        导致状态文案提前跳变，干扰 TTFT 测量。
+        使用配置文件中指定的音频文件 (audio.input_file)。
         """
         project_root = Path(__file__).parent.parent
 
-        # 优先使用"您好"音频（简单问候，AI 直接回复，无思考音效干扰）
-        hello_audio = project_root / "assets" / "audio" / "hello_nihao_edge_48k.wav"
-        if hello_audio.exists():
-            return str(hello_audio)
-
-        # 退而求其次用配置的文件
         audio_path = project_root / self.config.audio.input_file
         if not audio_path.exists():
+            # 配置的文件不存在，尝试生成默认问候语
             self._generate_hello_audio(str(audio_path))
         return str(audio_path)
 
@@ -603,6 +870,11 @@ class BenchmarkRunner:
         """运行完整测试"""
         if targets is None:
             targets = list(self.config.apps.keys())
+
+        # ── 环境预检：自动检测并启动模拟器/Appium ──
+        if not self.preflight_check():
+            logger.error("❌ 环境预检失败，终止测试")
+            return {}
 
         logger.info(f"🎙️ Voice Latency Benchmark 开始")
         logger.info(f"   目标: {targets}")
