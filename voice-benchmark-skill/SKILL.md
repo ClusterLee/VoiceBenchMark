@@ -123,7 +123,9 @@ python3 -m src.runner --inspect doubao
 
 1. **模拟器运行中**（带 gRPC 端口，**不能**加 `-no-audio`）：
    ```bash
-   ~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load
+   ~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -gpu host -no-snapshot-load
+   # ⚠️ 必须加 -gpu host：使用宿主机 GPU 硬件加速（Apple Silicon Metal / NVIDIA 等），
+   #    避免 lavapipe 纯 CPU 软件 Vulkan 渲染导致长时间运行后图形子系统 hang 崩溃
    # ⚠️ 必须加 -no-snapshot-load，否则音频 HAL 可能从快照恢复时 I/O error（宿主机听不到声音）
    # ⚠️ 禁止加 -no-audio，否则虚拟麦克风被禁用，APP 收不到注入的语音
    # ⚠️ 固化版本: Android 14 (API 34), Emulator 36.6.2, arm64-v8a, 1080x2400
@@ -276,6 +278,28 @@ python3 scripts/test_text_detection.py yuanbao --inject
 - **逻辑**：`force-stop + activate_app` 后，除了基础 sleep，额外用 `page_source` 轮询验证 UiAutomator2 真正就绪（最多 10s）
 - **效果**：确保后续 Appium 操作不会因 UI framework 未初始化而失败
 
+#### 5. GPU 硬件加速（`-gpu host`）
+- **位置**：`runner.py`，`_launch_new_emulator()` 启动参数
+- **问题**：模拟器默认可能使用 `lavapipe`（纯 CPU 软件 Vulkan 渲染），在长时间运行图形密集场景时 CPU 过载，导致图形子系统 **hang（卡死）** → watchdog 检测后杀进程 → 崩溃
+- **修复**：启动参数增加 `-gpu host`，AVD 配置文件 `hw.gpu.mode = host`
+- **效果**：
+  - Apple M4 Pro 启动时间：数分钟(lavapipe) → **9.7 秒**(host Metal)
+  - 渲染从 CPU 模拟切换到 Metal 硬件加速，长时间运行稳定
+  - crash dump 中的 `hanged` 标记不再出现
+- **⚠️ 注意**：切勿改回 `lavapipe` 或 `auto`。AVD 的 `config.ini` 和 `hardware-qemu.ini` 中 `hw.gpu.mode` 必须保持 `host`
+
+#### 6. 模拟器崩溃自动恢复（清理 5 步骤）
+- **位置**：`runner.py`，`_kill_stale_emulator_processes()`
+- **问题**：模拟器崩溃后常留下多种残留，阻止新实例正常启动
+- **清理流程**：
+  1. 杀残留 `qemu-system` 进程（SIGKILL）
+  2. 杀残留 `crashpad_handler` 进程
+  3. 关闭 macOS 崩溃报告对话框（osascript + pkill CrashReporterSupport）
+  4. 删除 AVD 锁文件（`~/.android/avd/*.avd/*.lock`）
+  5. 清理残留 crash 数据（`/tmp/android-$USER/emu-crash-*`）— 防止 crashpad 数据导致新进程崩溃
+  6. 重启 adb server（清除旧设备连接缓存）
+- **效果**：崩溃后自动清理 + 冷启动恢复，无需人工干预
+
 ### 优化效果对比
 
 | 指标 | 优化前 | 优化后 |
@@ -298,21 +322,34 @@ python3 scripts/test_text_detection.py yuanbao --inject
    # 验证：系统偏好设置 → 声音 → 输入，应能看到 "BlackHole 2ch"
    ```
    **注意**：不需要在「音频 MIDI 设置」中做任何聚合设备配置，只要 BlackHole 2ch 驱动安装即可。`setup_mac.sh` 已包含此步骤的自动安装。
-4. **通话音频路由（听不到 AI 回复声音）**：语音通话 APP 默认走 `STREAM_VOICE_CALL` → 听筒(earpiece)。模拟器的听筒音频不会路由到宿主机，导致在 Mac 上听不到声音。解决方案：`adb shell content insert --uri content://settings/system --bind name:s:speakerphone_on --bind value:s:1`（已集成到 `base_bot.py` 的 `_setup_audio_routing()` 自动执行）
-5. **waitForIdle 阻塞**：不设 `waitForIdleTimeout=0` 会导致 TTFT 虚高（测到 16-18s 而非 1-2s）
-6. **元宝 Session 崩溃**：连续多轮测试时元宝偶尔 Appium Session 断开。`reset_app()` + 异常恢复可缓解
-7. **字幕 Toggle 反转**：豆包字幕按钮盲点可能关闭字幕。必须先检测 content-desc 再决定是否点击
-8. **Edge TTS 必需**：macOS say 生成的语音 APP 识别不了，必须用 edge-tts
-9. **APP 冷启动卡顿**：`reset_app()` 后 APP 表面加载了但语音通话通道未建立。必须有 UI 就绪验证 + AI 问候等待，不能纯 sleep
-10. **AI 主动问候干扰注入**：豆包新建对话后常主动打招呼，此时注入音频会被 VAD 丢弃。必须等 AI 问候结束后再注入
-11. **模拟器长时间运行音频管道失效**：模拟器连续运行 48+ 小时后，gRPC 音频注入虽然显示成功，但 APP 无法识别语音。需要重启模拟器恢复
-12. **⚠️ 音频 HAL pcm_writei I/O error（宿主机听不到声音）**：模拟器从快照恢复或启动时宿主机音频设备状态异常，会导致音频 HAL `android.hardware.audio@7.1-impl.ranchu` 持续报 `pcm_writei failed with 'I/O error'`，表现为 gRPC `streamAudio` 返回 0 字节、宿主机完全听不到模拟器声音。**解决方案**：必须用 `-no-snapshot-load` 冷启动模拟器确保音频 HAL 干净初始化：
+4. **⚠️ GPU 必须用 host 模式（lavapipe 会崩溃）**：模拟器默认或配置为 `lavapipe`（纯 CPU 软件 Vulkan 渲染）时，在长时间运行图形密集的语音通话 APP 场景下，CPU 严重过载 → 图形子系统 hang 卡死 → 模拟器 crash。crash dump 特征：`hanged, 0x1, 0x1`。**解决方案**：
+   - 启动命令加 `-gpu host`（使用宿主机 GPU 硬件加速，Apple Silicon 走 Metal）
+   - AVD 配置文件 `~/.android/avd/Pixel_6_API_34.avd/config.ini` 和 `hardware-qemu.ini` 中设置 `hw.gpu.mode = host`
+   - **切勿**改回 `lavapipe` 或 `auto`
+   - 效果：启动时间从数分钟降到 ~10 秒，长时间运行稳定不崩溃
+   - 验证启动日志：应看到 `Selecting Vulkan device: Apple M4 Pro` + `Graphics API Version OpenGL ES 3.0 (4.1 Metal)`
+5. **⚠️ 模拟器崩溃后残留清理（5 项必须全做）**：模拟器 crash 后启动新实例前，必须清理：
+   - `qemu-system` 僵尸进程（`pkill -9 -f qemu-system`）
+   - `crashpad_handler` 残留进程（`pkill -f crashpad_handler`）
+   - AVD 锁文件（`rm -f ~/.android/avd/*.avd/*.lock`）— 否则报 `Running multiple emulators with the same AVD` FATAL
+   - Crash 数据目录（`rm -rf /tmp/android-$USER/emu-crash-*`）— 否则 crashpad 残留数据可能导致新进程崩溃
+   - 重启 adb server（`adb kill-server && adb start-server`）— 清除旧设备缓存
+   - 代码已集成到 `runner.py` 的 `_kill_stale_emulator_processes()` 自动执行
+6. **通话音频路由（听不到 AI 回复声音）**：语音通话 APP 默认走 `STREAM_VOICE_CALL` → 听筒(earpiece)。模拟器的听筒音频不会路由到宿主机，导致在 Mac 上听不到声音。解决方案：`adb shell content insert --uri content://settings/system --bind name:s:speakerphone_on --bind value:s:1`（已集成到 `base_bot.py` 的 `_setup_audio_routing()` 自动执行）
+7. **waitForIdle 阻塞**：不设 `waitForIdleTimeout=0` 会导致 TTFT 虚高（测到 16-18s 而非 1-2s）
+8. **元宝 Session 崩溃**：连续多轮测试时元宝偶尔 Appium Session 断开。`reset_app()` + 异常恢复可缓解
+9. **字幕 Toggle 反转**：豆包字幕按钮盲点可能关闭字幕。必须先检测 content-desc 再决定是否点击
+10. **Edge TTS 必需**：macOS say 生成的语音 APP 识别不了，必须用 edge-tts
+11. **APP 冷启动卡顿**：`reset_app()` 后 APP 表面加载了但语音通话通道未建立。必须有 UI 就绪验证 + AI 问候等待，不能纯 sleep
+12. **AI 主动问候干扰注入**：豆包新建对话后常主动打招呼，此时注入音频会被 VAD 丢弃。必须等 AI 问候结束后再注入
+13. **模拟器长时间运行音频管道失效**：模拟器连续运行 48+ 小时后，gRPC 音频注入虽然显示成功，但 APP 无法识别语音。需要重启模拟器恢复
+14. **⚠️ 音频 HAL pcm_writei I/O error（宿主机听不到声音）**：模拟器从快照恢复或启动时宿主机音频设备状态异常，会导致音频 HAL `android.hardware.audio@7.1-impl.ranchu` 持续报 `pcm_writei failed with 'I/O error'`，表现为 gRPC `streamAudio` 返回 0 字节、宿主机完全听不到模拟器声音。**解决方案**：必须用 `-no-snapshot-load` 冷启动模拟器确保音频 HAL 干净初始化：
    ```bash
    # 1. 关闭当前模拟器
    adb emu kill
    # 2. 等待完全关闭
    sleep 5
-   # 3. 冷启动（关键：-no-snapshot-load）
-   ~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load
+   # 3. 冷启动（关键：-gpu host -no-snapshot-load）
+   ~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -gpu host -no-snapshot-load
    ```
    **诊断方法**：`adb shell "logcat -d | grep pcm_writei"` 如果有 I/O error 就说明需要冷启动

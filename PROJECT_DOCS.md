@@ -174,8 +174,8 @@ D1 数据库 (SQLite)
 ### 4.3 关键命令
 
 ```bash
-# 启动模拟器（⚠️ 不能加 -no-audio，必须加 -no-snapshot-load）
-~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load
+# 启动模拟器（⚠️ 不能加 -no-audio，必须加 -gpu host 和 -no-snapshot-load）
+~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -gpu host -no-snapshot-load
 
 # 启动 Appium
 appium &
@@ -264,12 +264,13 @@ npm run deploy
 
 | # | 坑 | 后果 | 解决 |
 |---|---|---|---|
-| 1 | **模拟器禁止 `-no-audio`** | 虚拟麦克风被禁用，APP 完全收不到语音，永远卡在 "Listening..." | 启动参数只能用 `-avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load` |
+| 1 | **模拟器禁止 `-no-audio`** | 虚拟麦克风被禁用，APP 完全收不到语音，永远卡在 "Listening..." | 启动参数只能用 `-avd Pixel_6_API_34 -grpc 8554 -gpu host -no-snapshot-load` |
 | 2 | **gRPC 必须 `-grpc 8554`** | injectAudio 鉴权失败 | 必须带此参数禁用 JWT |
 | 3 | **Mac 无麦克风致模拟器崩溃** 💥 | 调用 gRPC `injectAudio` 时模拟器直接 crash。日志：`Could not initialize record - Unknown Audiodevice` + `Failed to create voice 'adc'` | 安装 BlackHole 2ch 虚拟音频驱动：`brew install blackhole-2ch && sudo killall -9 coreaudiod`（Mac mini/Mac Studio 等无内置麦克风的机型必装）|
 | 4 | **必须设 `waitForIdleTimeout=0`** | TTFT 虚高到 16-18s（实际只有 1-2s）| UiAutomator2 默认等 UI idle，语音通话中永远不 idle |
-| 5 | **必须加 `-no-snapshot-load`** | 音频 HAL pcm_writei I/O error，宿主机完全听不到模拟器声音 | 模拟器从快照恢复时音频 HAL 可能未正确初始化。诊断：`adb shell "logcat -d \| grep pcm_writei"`。修复：`adb emu kill && sleep 5 && emulator -avd Pixel_6_API_34 -grpc 8554 -no-snapshot-load` |
-| 5 | **Cloudflare Bot Fight Mode** | Python urllib 被 403 拦截 | uploader 已设 `User-Agent: VoiceBenchmark/1.0` |
+| 5 | **必须加 `-no-snapshot-load`** | 音频 HAL pcm_writei I/O error，宿主机完全听不到模拟器声音 | 模拟器从快照恢复时音频 HAL 可能未正确初始化。诊断：`adb shell "logcat -d \| grep pcm_writei"`。修复：`adb emu kill && sleep 5 && emulator -avd Pixel_6_API_34 -grpc 8554 -gpu host -no-snapshot-load` |
+| 6 | **必须加 `-gpu host`** 💥 | lavapipe 软件渲染导致长时间运行后图形子系统 hang 崩溃（crash dump: `hanged`）| AVD 的 config.ini/hardware-qemu.ini 设 `hw.gpu.mode = host`，启动加 `-gpu host`。Apple Silicon 走 Metal 硬件加速，启动 ~10s（lavapipe 要数分钟）|
+| 7 | **Cloudflare Bot Fight Mode** | Python urllib 被 403 拦截 | uploader 已设 `User-Agent: VoiceBenchmark/1.0` |
 
 ### 🟠 运维级（日常关注）
 

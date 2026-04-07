@@ -179,16 +179,242 @@ class BenchmarkRunner:
         except Exception:
             return False
 
+    @staticmethod
+    def _is_qemu_running() -> bool:
+        """检查 qemu 进程是否存在（不依赖 adb，直接看进程表）
+
+        用于区分：
+        - qemu 进程存在 + adb 能看到 emulator → 模拟器正在启动中
+        - qemu 进程存在 + adb 看不到 → 模拟器刚启动还没注册到 adb
+        - qemu 进程不存在 → 模拟器已崩溃/未运行，可以安全清理
+        """
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "qemu-system.*-avd"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
+
+    @classmethod
+    def _kill_stale_emulator_processes(cls) -> None:
+        """清理残留的模拟器进程（qemu、crashpad_handler）和 adb server
+
+        模拟器崩溃后常留下僵尸 crashpad_handler 和 AVD 锁文件，
+        导致新模拟器无法正常启动。此方法在启动前强制清理。
+        """
+        import signal
+
+        # 1. 杀残留 qemu 进程
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "qemu-system.*-avd"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for pid_str in result.stdout.strip().split("\n"):
+                pid_str = pid_str.strip()
+                if pid_str:
+                    try:
+                        os.kill(int(pid_str), signal.SIGKILL)
+                        logger.info(
+                            f"🧹 [Cleanup] 已杀残留 qemu 进程: {pid_str}"
+                        )
+                    except (ProcessLookupError, PermissionError):
+                        pass
+        except Exception:
+            pass
+
+        # 2. 杀残留 crashpad_handler（模拟器崩溃报告进程）
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "crashpad_handler.*emu-crash"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for pid_str in result.stdout.strip().split("\n"):
+                pid_str = pid_str.strip()
+                if pid_str:
+                    try:
+                        os.kill(int(pid_str), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+            if result.stdout.strip():
+                logger.info("🧹 [Cleanup] 已清理残留 crashpad_handler 进程")
+        except Exception:
+            pass
+
+        # 2.5 关闭崩溃报告对话框（macOS 上的 "Android Emulator closed unexpectedly" 窗口）
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to '
+                 'if exists (process "qemu-system-aarch64") then '
+                 'tell process "qemu-system-aarch64" to '
+                 'click button "Don\'t send" of window 1 end tell end if'],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+        # 也尝试直接关闭残留的崩溃报告窗口进程
+        try:
+            subprocess.run(
+                ["pkill", "-f", "CrashReporterSupport"],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+
+        # 3. 删除 AVD 锁文件（防止 "emulator is already running" 误判）
+        avd_dir = os.path.expanduser("~/.android/avd")
+        if os.path.isdir(avd_dir):
+            import glob
+            for lock_file in glob.glob(os.path.join(avd_dir, "*.avd/*.lock")):
+                try:
+                    os.remove(lock_file)
+                    logger.info(
+                        f"🧹 [Cleanup] 已删除锁文件: "
+                        f"{os.path.basename(lock_file)}"
+                    )
+                except OSError:
+                    pass
+
+        # 3.5 清理残留 crash 数据（防止 crashpad 引起新进程崩溃）
+        import shutil
+        crash_dir = os.path.expanduser("/tmp/android-{}/".format(
+            os.environ.get("USER", "unknown")
+        ))
+        if os.path.isdir(crash_dir):
+            for entry in os.listdir(crash_dir):
+                if entry.startswith("emu-crash"):
+                    crash_path = os.path.join(crash_dir, entry)
+                    try:
+                        shutil.rmtree(crash_path)
+                        logger.info(
+                            f"🧹 [Cleanup] 已清理 crash 数据: {entry}"
+                        )
+                    except OSError:
+                        pass
+
+        # 4. 重启 adb server（清除旧设备连接缓存）
+        adb = cls._find_adb()
+        try:
+            subprocess.run(
+                [adb, "kill-server"],
+                capture_output=True, timeout=5,
+            )
+            time.sleep(1)
+            subprocess.run(
+                [adb, "start-server"],
+                capture_output=True, timeout=10,
+            )
+            logger.info("🧹 [Cleanup] adb server 已重启")
+        except Exception:
+            pass
+
+        # 等待清理生效
+        time.sleep(2)
+
     @classmethod
     def _start_emulator(cls, avd_name: str = "Pixel_6_API_34",
                         grpc_port: int = 8554,
-                        timeout: float = 120.0) -> bool:
+                        timeout: float = 300.0) -> bool:
         """启动 Android 模拟器并等待 boot 完成
+
+        智能清理策略：
+        - 如果 qemu 进程存在且 adb 能看到 emulator → 正在启动中，等待即可
+        - 如果 qemu 进程存在但 adb 看不到 → 给它一些时间注册到 adb
+        - 如果 qemu 不存在 → 安全清理残留锁文件，启动新模拟器
 
         Args:
             avd_name: AVD 名称
             grpc_port: gRPC 端口
-            timeout: 最大等待时间（秒）
+            timeout: 最大等待时间（秒），默认 300s（崩溃后冷启动可能需要更长时间）
+
+        Returns:
+            True = 启动成功, False = 超时/失败
+        """
+        qemu_alive = cls._is_qemu_running()
+        adb_visible = cls._is_emulator_running()
+
+        if qemu_alive and adb_visible:
+            # ── 情况 1: qemu 在跑 + adb 可见 → 正在启动中，直接等 ──
+            logger.info(
+                "⏳ [Preflight] qemu 进程存在且 adb 可见 emulator，"
+                "判定模拟器正在启动中，等待 boot 完成..."
+            )
+        elif qemu_alive and not adb_visible:
+            # ── 情况 2: qemu 在跑 + adb 看不到 → 给它时间注册 ──
+            logger.info(
+                "⏳ [Preflight] qemu 进程存在但 adb 未发现设备，"
+                "等待最多 60s 让模拟器注册到 adb..."
+            )
+            grace_start = time.time()
+            grace_timeout = 60.0
+            while time.time() - grace_start < grace_timeout:
+                if cls._is_emulator_running():
+                    logger.info(
+                        "✅ [Preflight] 模拟器已注册到 adb，继续等待 boot..."
+                    )
+                    break
+                time.sleep(5)
+            else:
+                # 60s 内 adb 仍看不到 → 这是真正的僵尸进程，清理重来
+                logger.warning(
+                    f"⚠️ [Preflight] qemu 运行 {grace_timeout:.0f}s 后"
+                    f"仍未注册到 adb，判定为僵尸进程，清理后重启..."
+                )
+                cls._kill_stale_emulator_processes()
+                return cls._launch_new_emulator(avd_name, grpc_port, timeout)
+        else:
+            # ── 情况 3: qemu 不存在 → 清理残留 + 启动新模拟器 ──
+            logger.info("🧹 [Preflight] 无 qemu 进程，清理残留后启动新模拟器...")
+            cls._kill_stale_emulator_processes()
+            return cls._launch_new_emulator(avd_name, grpc_port, timeout)
+
+        # ── 等待 boot_completed（情况 1 & 2 走到这里）──
+        t_start = time.time()
+        poll_interval = 5.0
+        while time.time() - t_start < timeout:
+            if cls._is_emulator_running() and cls._is_emulator_booted():
+                elapsed = time.time() - t_start
+                logger.info(
+                    f"✅ [Preflight] 模拟器已启动 ({elapsed:.0f}s)"
+                )
+                return True
+            # 如果 qemu 进程消失了（崩溃），立即清理重启
+            if not cls._is_qemu_running():
+                elapsed = time.time() - t_start
+                logger.warning(
+                    f"⚠️ [Preflight] 等待中 qemu 进程消失了"
+                    f" ({elapsed:.0f}s)，清理后重启..."
+                )
+                cls._kill_stale_emulator_processes()
+                remaining = timeout - elapsed
+                if remaining > 60:
+                    return cls._launch_new_emulator(
+                        avd_name, grpc_port, remaining
+                    )
+                else:
+                    logger.error(
+                        f"❌ [Preflight] 剩余时间不足 ({remaining:.0f}s)，放弃"
+                    )
+                    return False
+            time.sleep(poll_interval)
+
+        logger.error(
+            f"❌ [Preflight] 模拟器启动超时 ({timeout}s)"
+        )
+        return False
+
+    @classmethod
+    def _launch_new_emulator(cls, avd_name: str, grpc_port: int,
+                             timeout: float) -> bool:
+        """启动全新模拟器进程并等待 boot 完成（内部方法）
+
+        Args:
+            avd_name: AVD 名称
+            grpc_port: gRPC 端口
+            timeout: 最大等待时间
 
         Returns:
             True = 启动成功, False = 超时/失败
@@ -196,7 +422,7 @@ class BenchmarkRunner:
         emu = cls._find_emulator()
         logger.info(
             f"🚀 [Preflight] 启动模拟器: {emu} -avd {avd_name} "
-            f"-grpc {grpc_port} -no-snapshot-load"
+            f"-grpc {grpc_port} -gpu host -no-snapshot-load"
         )
 
         # 设置环境变量（确保 Android SDK 工具链可用）
@@ -213,6 +439,7 @@ class BenchmarkRunner:
             subprocess.Popen(
                 [emu, "-avd", avd_name,
                  "-grpc", str(grpc_port),
+                 "-gpu", "host",
                  "-no-snapshot-load"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -317,7 +544,7 @@ class BenchmarkRunner:
                 logger.info("✅ [Preflight] 模拟器运行中且已启动完成")
             else:
                 logger.info("⏳ [Preflight] 模拟器运行中，等待启动完成...")
-                for _ in range(24):  # 最多等 120s
+                for _ in range(60):  # 最多等 300s（崩溃后冷启动需要更长时间）
                     if self._is_emulator_booted():
                         break
                     time.sleep(5)
@@ -326,6 +553,16 @@ class BenchmarkRunner:
                 else:
                     logger.error("❌ [Preflight] 模拟器启动超时")
                     all_ok = False
+        elif self._is_qemu_running():
+            # qemu 进程在跑但 adb 没看到 → 模拟器正在启动中
+            # 不要杀它！交给 _start_emulator 的智能逻辑处理
+            logger.info(
+                "⏳ [Preflight] qemu 进程存在但 adb 未发现设备，"
+                "模拟器可能正在启动中..."
+            )
+            avd = getattr(self.config.device, 'avd_name', 'Pixel_6_API_34')
+            if not self._start_emulator(avd_name=avd):
+                all_ok = False
         else:
             logger.warning("⚠️ [Preflight] 模拟器未运行，尝试自动启动...")
             avd = getattr(self.config.device, 'avd_name', 'Pixel_6_API_34')
@@ -939,6 +1176,29 @@ class BenchmarkRunner:
                                         )
                                         continue
                                     else:
+                                        # Session 恢复失败 → 检查是否模拟器挂了
+                                        if not self._is_emulator_running():
+                                            logger.warning(
+                                                f"[{target}] 🔧 模拟器已崩溃，"
+                                                f"尝试完整环境恢复..."
+                                            )
+                                            if self.preflight_check():
+                                                logger.info(
+                                                    f"[{target}] ✅ 环境恢复成功，"
+                                                    f"重建 Appium session..."
+                                                )
+                                                # 重建 gRPC 连接
+                                                try:
+                                                    self.injector.reconnect()
+                                                    self._injector_connected = True
+                                                except Exception:
+                                                    pass
+                                                if self._reconnect_appium_session(bot):
+                                                    logger.info(
+                                                        f"[{target}] ♻️ 模拟器恢复后"
+                                                        f"重试第 {round_num+1} 轮"
+                                                    )
+                                                    continue
                                         logger.error(
                                             f"[{target}] ❌ Session 恢复失败，"
                                             f"跳过后续轮次"
