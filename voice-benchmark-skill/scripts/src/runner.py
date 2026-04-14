@@ -181,11 +181,14 @@ class BenchmarkRunner:
             return False
 
     @classmethod
-    def _wait_for_adb_device(cls, timeout: float = 60.0) -> bool:
-        """等待 adb 设备完全就绪（emulator-5554 状态为 'device'）
+    def _wait_for_adb_device(cls, timeout: float = 90.0) -> bool:
+        """等待 adb 设备完全就绪（能实际执行 shell 命令）
 
-        模拟器 boot_completed=1 后，adb 设备可能仍未完全注册，
-        Appium 创建 session 需要 adb 设备处于 'device' 状态。
+        模拟器 boot_completed=1 后，adb 设备可能经历：
+        1. 不在 adb devices 列表中
+        2. 状态为 'offline'
+        3. 状态为 'device' 但 shell 命令返回 'device offline'
+        4. shell 命令真正可执行 ← 只有这里才算就绪
 
         Args:
             timeout: 最大等待时间（秒）
@@ -196,27 +199,59 @@ class BenchmarkRunner:
         adb = cls._find_adb()
         t_start = time.time()
         poll_interval = 3.0
+        saw_device = False
 
         while time.time() - t_start < timeout:
             try:
+                # 第一步：检查 adb devices 列表中有 device 状态
                 result = subprocess.run(
                     [adb, "devices"],
                     capture_output=True, text=True, timeout=5,
                 )
-                # 查找 "emulator-5554\tdevice" 行（注意是 tab 分隔）
+                has_device = False
                 for line in result.stdout.strip().split("\n"):
                     if "emulator-" in line and "\tdevice" in line:
-                        elapsed = time.time() - t_start
-                        logger.info(
-                            f"✅ [ADB] 设备已就绪: {line.strip()} "
-                            f"({elapsed:.0f}s)"
-                        )
-                        # 额外等待 5s 让 adb 连接完全稳定
-                        # （避免 Appium 创建 session 时 race condition）
-                        time.sleep(5)
-                        return True
-            except Exception:
-                pass
+                        has_device = True
+                        if not saw_device:
+                            saw_device = True
+                            elapsed = time.time() - t_start
+                            logger.info(
+                                f"⏳ [ADB] 设备出现在列表中 ({elapsed:.0f}s)，"
+                                f"验证 shell 可用性..."
+                            )
+                        break
+
+                if not has_device:
+                    time.sleep(poll_interval)
+                    continue
+
+                # 第二步：验证 adb shell 真正可执行
+                shell_result = subprocess.run(
+                    [adb, "-s", "emulator-5554", "shell", "echo", "ready"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if (shell_result.returncode == 0
+                        and "ready" in shell_result.stdout
+                        and "offline" not in shell_result.stderr.lower()):
+                    elapsed = time.time() - t_start
+                    logger.info(
+                        f"✅ [ADB] 设备已就绪且 shell 可用 ({elapsed:.0f}s)"
+                    )
+                    # 额外等待 8s 让设备服务完全启动
+                    # （settings provider 等系统服务可能仍在初始化）
+                    time.sleep(8)
+                    return True
+                else:
+                    logger.debug(
+                        f"[ADB] shell 尚不可用: "
+                        f"rc={shell_result.returncode}, "
+                        f"out={shell_result.stdout.strip()!r}, "
+                        f"err={shell_result.stderr.strip()!r}"
+                    )
+
+            except Exception as e:
+                logger.debug(f"[ADB] 检查异常: {e}")
+
             time.sleep(poll_interval)
 
         logger.error(f"❌ [ADB] 设备等待超时 ({timeout}s)")
