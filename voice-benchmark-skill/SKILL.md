@@ -24,7 +24,8 @@ AI 语音助手响应延迟自动化评测工具。**自包含 skill**，包含�
 
 ```
 scripts/
-├── run_benchmark.sh          # 一键运行脚本
+├── run_loop.sh               # ⭐ 外壳循环模式（推荐，进程级隔离恢复）
+├── run_benchmark.sh          # 一键运行脚本（单进程模式）
 ├── generate_audio.py         # Edge TTS 音频生成
 ├── requirements.txt          # Python 依赖
 ├── README.md                 # 项目说明
@@ -119,23 +120,23 @@ python3 -m src.runner --inspect doubao
 
 ### ⚡ 默认测试行为约定
 
-当用户说 **"开始测试 N 次"** 或 **"开始 N 轮测试"**（无其他参数），默认执行：
+当用户说 **"开始测试 N 次"** 或 **"开始 N 轮测试"** 或 **"开始测试"**（无其他参数），**必须使用 `run_loop.sh` 外壳循环模式**：
 
 ```bash
-python3 -m src.runner -n <N> -r 2
+cd scripts/
+nohup ./run_loop.sh <N> 5 2 > results/loop_<N>x2_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
-即 **N 大轮，每轮元宝×2 + 豆包×2**，总测试数 = N × 4。
+- **N 默认 1000**（用户只说"开始测试"时）
+- 每批次 5 轮，每轮元宝×2 + 豆包×2，总测试数 = N × 4
+- 批次之间自动清理进程 + 重启 coreaudiod + 冷却 30s
 
 例如：
-- "开始测试 1000 次" → `python3 -m src.runner -n 1000 -r 2`（共 4000 次）
-- "开始测试 100 次" → `python3 -m src.runner -n 100 -r 2`（共 400 次）
-- "只测豆包 50 轮" → `python3 -m src.runner -t doubao -n 50 -r 2`（共 100 次）
+- "开始测试" → `./run_loop.sh 1000 5 2`（共 4000 次）
+- "开始测试 1000 次" → `./run_loop.sh 1000 5 2`（共 4000 次）
+- "开始测试 100 次" → `./run_loop.sh 100 5 2`（共 400 次）
 
-后台运行推荐：
-```bash
-nohup python3 -m src.runner -n 1000 -r 2 > results/run_<N>x2_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-```
+**⚠️ 禁止直接用 `python3 -m src.runner -n 1000`**：单进程模式无法做到进程级隔离恢复，QEMU 崩溃后 gRPC/adb 状态混乱会导致后续测试全部失败。必须用 `run_loop.sh` 外壳循环。
 
 ## 前置条件
 
@@ -182,7 +183,8 @@ Edge TTS 语音 → gRPC 注入模拟器虚拟麦克风 → APP 语音通话
 
 | 文件 | 职责 |
 |------|------|
-| `src/runner.py` | 主入口 + CLI（Click）。BenchmarkRunner 编排测试流程。含崩溃恢复、全局重置、coreaudiod 重启 |
+| `run_loop.sh` | ⭐ 外壳循环模式入口。进程级隔离恢复：小批次运行→崩溃→清理→coreaudiod→冷却→新进程 |
+| `src/runner.py` | 主入口 + CLI（Click）。BenchmarkRunner 编排测试流程。含崩溃恢复（v3: 失败 exit）、全局重置、coreaudiod 重启、adb 两阶段验证 |
 | `src/config.py` | 配置管理（dataclass + YAML）|
 | `src/automation/base_bot.py` | Appium 自动化基类（ABC）|
 | `src/automation/doubao_bot.py` | 豆包 APP 自动化（resource-id 定位）|
@@ -342,21 +344,24 @@ python3 scripts/test_text_detection.py yuanbao --inject
   如无 sudo 权限，自动降级尝试 `launchctl kickstart -k system/com.apple.audio.coreaudiod`
 - **效果**：解决"崩溃后新模拟器也秒崩"的问题
 
-#### 8. 全局完整环境重置（`_full_environment_reset()`）
+#### 8. 全局完整环境重置 — v3 进程退出策略（`_full_environment_reset()`）
 - **位置**：`runner.py`，`_full_environment_reset()`
+- **v3 核心设计**：**不在进程内反复挣扎恢复**。任何步骤失败 → `sys.exit(1)` → 外壳循环 `run_loop.sh` 接管（杀进程→coreaudiod→冷却→全新 Python 进程）
 - **触发条件**：
   - Appium session 轻量恢复失败
   - 音频管道连续失败 ≥ `AUDIO_PIPE_MAX_CONSEC_FAIL` 次
   - Bot driver 为 None 且主动连接失败
-- **执行流程（6 步）**：
+- **执行流程（7 步，任一失败直接 exit）**：
   1. 断开所有 Bot
   2. 杀掉模拟器 + 清理残留（含 coreaudiod 重启）
   3. 冷却等待 30 秒（`COOLDOWN_AFTER_CRASH_SECS`）
   4. preflight 重新拉起模拟器 + Appium
+  4.5. `_wait_for_adb_device()` 两阶段验证 adb 设备就绪
   5. 重建 gRPC 连接
-  6. 重连所有 Bot
-- **设计思路**：等价于之前有效的 bash 外壳循环策略（4/7~4/8 无限循环期间 49 次崩溃全部自动恢复的实证方案）
-- **效果**：模拟器崩溃后自动全链路重置，无人值守长时间运行
+  5.5. gRPC 重连后再次验证 adb（gRPC 长重连可能导致 adb 状态漂移）
+  6. 重连所有 Bot（只试一次，失败就 exit）
+- **设计依据**：之前 21h/214批/49次崩溃全自动恢复的实证——进程级隔离是最可靠的恢复策略
+- **效果**：配合 `run_loop.sh`，模拟器崩溃后自动全链路重置，无人值守长时间运行
 
 #### 9. "永不放弃"策略
 - **位置**：`runner.py`，`_run_target_round()`
@@ -368,16 +373,43 @@ python3 scripts/test_text_detection.py yuanbao --inject
   - `MAX_RETRIES_EXHAUSTED` → 记录空结果但继续下一轮
 - **效果**：永远不放弃任何 target，最大化有效数据产出
 
+#### 10. 外壳循环模式 `run_loop.sh`（⭐ 生产推荐）
+- **位置**：`scripts/run_loop.sh`
+- **问题**：单进程 `-n 1000` 运行时，QEMU 崩溃后 gRPC/adb 状态在进程内无法可靠恢复。v2 尝试在进程内做 `_full_environment_reset()` 反复重试，但 gRPC 长重连会导致 adb 状态漂移（device offline），Appium 创建 session 失败
+- **解决方案**：复刻之前跑 21h/214批/49次崩溃全自动恢复的 bash 外壳策略：
+  ```bash
+  ./run_loop.sh 1000 5 2    # 总共 1000 轮，每批 5 轮，每轮每 target 2 次
+  ```
+- **工作原理**：
+  1. 按批次运行 Python runner（小批次，默认 5 轮/批）
+  2. 每批次结束/崩溃后：`kill_all()`（杀 qemu/appium/adb + 关闭崩溃弹窗 + 清理锁文件）
+  3. `restart_coreaudiod()`（重启音频守护进程）
+  4. 冷却 30 秒
+  5. 启动全新 Python 进程（进程级隔离，零僵死状态）
+- **runner.py 配合**：`_full_environment_reset()` 任何步骤失败 → `sys.exit(1)` → 外壳接管
+- **效果**：进程级隔离 = 最可靠的恢复策略。Python 内存泄漏、僵死线程、未捕获异常均被新进程自然解决
+
+#### 11. adb 设备两阶段就绪验证（`_wait_for_adb_device()`）
+- **位置**：`runner.py`，`_wait_for_adb_device()`
+- **问题**：模拟器 `sys.boot_completed=1` ≠ adb 设备完全就绪。`adb shell` 可能返回 `device offline`，导致 Appium 创建 session 失败
+- **修复**：两阶段验证 + 稳定等待：
+  1. **阶段 1**：`adb devices` 列出 `emulator-5554\tdevice`（不是 `offline`）
+  2. **阶段 2**：`adb shell echo ready` 实际返回成功（无 offline 错误）
+  3. **稳定等待**：额外 8 秒，等待 settings provider 等系统服务完全初始化
+- **调用位置**：`_full_environment_reset()` 步骤 4.5 和 5.5、`preflight_check()` 模拟器启动后
+- **效果**：消除崩溃恢复后 "Could not find a connected Android device" 问题
+
 ### 优化效果对比
 
-| 指标 | 优化前 | 优化后（v1 稳定性） | 崩溃恢复（v2） |
-|------|--------|---------------------|----------------|
-| 5 轮成功率 | 60%（3/5 正常） | **100%** | **100%** |
-| 平均 TTFT | 11999ms（含异常） | **1141ms** | **~1500ms** |
-| TTFT 范围 | 877 ~ 48688ms | 811 ~ 1557ms | 904 ~ 2420ms |
-| 崩溃恢复能力 | ❌ 无 | ⚠️ 轻量（session 重建） | ✅ 全链路（含模拟器+coreaudiod+gRPC） |
-| 连续运行能力 | 10 轮内崩溃 | ~30 分钟后崩溃 | **无限运行**（自动恢复） |
-| 数据有效率 | <30% | ~95% | **>95%**（崩溃恢复后继续采集） |
+| 指标 | 优化前 | v1 稳定性 | v2 崩溃恢复 | v3 外壳循环（⭐当前） |
+|------|--------|-----------|-------------|---------------------|
+| 5 轮成功率 | 60% | **100%** | **100%** | **100%** |
+| 平均 TTFT | 11999ms | **1141ms** | **~1500ms** | **~1500ms** |
+| TTFT 范围 | 877~48688ms | 811~1557ms | 904~2420ms | 904~2420ms |
+| 崩溃恢复 | ❌ 无 | ⚠️ session 重建 | ✅ 全链路（进程内） | ✅ **进程级隔离**（最可靠） |
+| 连续运行 | 10 轮崩溃 | ~30 分钟 | **理论无限**（进程内恢复不稳定） | **实证 21h+**（214批/49次崩溃恢复） |
+| 数据有效率 | <30% | ~95% | >95%（恢复不稳定时降低） | **>95%**（进程级隔离保证） |
+| 运行方式 | 手动 | `python -n N` | `python -n N` | `run_loop.sh N 5 2` |
 
 ## 已知坑
 
@@ -429,4 +461,6 @@ python3 scripts/test_text_detection.py yuanbao --inject
    echo "$USER ALL=(root) NOPASSWD: /usr/bin/killall coreaudiod" | sudo tee /etc/sudoers.d/coreaudiod-restart && sudo chmod 0440 /etc/sudoers.d/coreaudiod-restart
    ```
    如未配置，降级尝试 `launchctl kickstart` 但可能权限不足
-17. **⚠️ 单进程长时间运行 vs bash 外壳循环**：`-n 1000` 单进程运行崩溃后的恢复依赖 `_full_environment_reset()` 内部机制。之前有效的 bash 外壳循环策略（`while true; do python runner.py -n 3; sleep 60; done`）通过进程级隔离天然具备恢复能力。当前 runner 已将该策略内化，但如遇极端情况（如内存泄漏），可回退到 bash 外壳循环模式
+17. **⚠️ 禁止单进程长时间运行，必须用外壳循环**：`python3 -m src.runner -n 1000` 单进程运行时，QEMU 崩溃后进程内 `_full_environment_reset()` 尝试恢复，但 gRPC 长重连会导致 adb 状态漂移（device offline），后续所有 Appium session 创建失败。**唯一可靠方案是 `run_loop.sh` 外壳循环**——进程级隔离天然解决所有僵死状态问题。实证：21h/214批/49次崩溃全自动恢复。runner.py 内的 `_full_environment_reset()` 作为第一道防线，失败时 `sys.exit(1)` 交给外壳接管
+18. **⚠️ adb boot_completed ≠ 设备就绪**：模拟器 `sys.boot_completed=1` 后 `adb shell` 仍可能返回 `device offline`。必须用 `_wait_for_adb_device()` 做两阶段验证（`adb devices` 列出 device + `adb shell echo ready` 成功）+ 8s 稳定等待
+19. **⚠️ 模拟器磁盘空间不足**：长时间运行后模拟器 `/data` 分区可能满（95%+），导致 Appium UiAutomator2 APK 安装失败（`not enough space`）。外壳循环每批次重启模拟器时用 `-no-snapshot-load` 冷启动可缓解。极端情况需手动 `adb shell pm clear` 清理缓存
