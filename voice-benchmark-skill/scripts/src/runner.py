@@ -417,7 +417,7 @@ class BenchmarkRunner:
             logger.info("🧹 [Preflight] 无 qemu 进程，清理残留后启动新模拟器...")
             cls._kill_stale_emulator_processes()
             return cls._launch_new_emulator(avd_name, grpc_port, timeout,
-                                            after_crash=True)
+                                            after_crash=False)
 
         # ── 等待 boot_completed（情况 1 & 2 走到这里）──
         t_start = time.time()
@@ -1260,6 +1260,30 @@ class BenchmarkRunner:
         # 全局轮序号（用于 gRPC 预防重建判断）
         global_round = round_num * 2 + sub_round  # 每轮每 target 2 次
 
+        # ── 检查 bot 连接状态，必要时主动连接 ──
+        if not getattr(bot, 'driver', None):
+            logger.warning(
+                f"[{target}] ⚠️ Bot driver 为 None，尝试主动连接..."
+            )
+            try:
+                bot.connect(skip_reinstall=True)
+                logger.info(f"[{target}] ✅ Bot 已重新连接")
+            except Exception as conn_e:
+                logger.error(
+                    f"[{target}] ❌ Bot 连接失败: {conn_e}，触发全局重置"
+                )
+                if bots and self._full_environment_reset(bots):
+                    return None  # 信号：重试
+                return LatencyResult(
+                    e2e_latency=0, ttfr=0,
+                    total_response_time=0,
+                    user_speech_start=0, user_speech_end=0,
+                    ai_speech_start=0, ai_speech_end=0,
+                    target=target, round_num=round_num,
+                    is_valid=False,
+                    error_msg=f"BOT_CONNECT_FAILED: {conn_e}",
+                )
+
         # ── 预防性 gRPC 重建（每 N 轮）──
         if self._should_reconnect_grpc(global_round):
             logger.info(
@@ -1279,7 +1303,8 @@ class BenchmarkRunner:
                     or "InvalidSessionId" in err_msg
                     or "device not found" in err_msg
                     or "instrumentation process is not running" in err_msg
-                    or "cannot be proxied" in err_msg):
+                    or "cannot be proxied" in err_msg
+                    or "'NoneType' object has no attribute" in err_msg):
 
                 count = session_reconnect_counts.get(target, 0)
                 if count < self.SESSION_MAX_RECONNECT:
@@ -1433,6 +1458,19 @@ class BenchmarkRunner:
         """
         if targets is None:
             targets = list(self.config.apps.keys())
+
+        # ── 确保 Android SDK 工具（adb 等）在 PATH 中 ──
+        android_home = os.path.expanduser("~/Library/Android/sdk")
+        sdk_paths = [
+            os.path.join(android_home, "platform-tools"),
+            os.path.join(android_home, "emulator"),
+        ]
+        current_path = os.environ.get("PATH", "")
+        for p in sdk_paths:
+            if os.path.isdir(p) and p not in current_path:
+                os.environ["PATH"] = p + os.pathsep + current_path
+                current_path = os.environ["PATH"]
+                logger.info(f"🔧 [PATH] 已添加: {p}")
 
         # ── 环境预检：自动检测并启动模拟器/Appium ──
         if not self.preflight_check():

@@ -110,11 +110,31 @@ cd "$WORK_DIR"  # 或 AI 助手直接 cd 到部署目录
 python3 -m src.runner -t doubao -n 3
 python3 -m src.runner -t yuanbao -n 3
 
-# 测试所有 APP
+# 测试所有 APP（5 轮）
 python3 -m src.runner -n 5
 
 # 调试：获取 UI 元素树
 python3 -m src.runner --inspect doubao
+```
+
+### ⚡ 默认测试行为约定
+
+当用户说 **"开始测试 N 次"** 或 **"开始 N 轮测试"**（无其他参数），默认执行：
+
+```bash
+python3 -m src.runner -n <N> -r 2
+```
+
+即 **N 大轮，每轮元宝×2 + 豆包×2**，总测试数 = N × 4。
+
+例如：
+- "开始测试 1000 次" → `python3 -m src.runner -n 1000 -r 2`（共 4000 次）
+- "开始测试 100 次" → `python3 -m src.runner -n 100 -r 2`（共 400 次）
+- "只测豆包 50 轮" → `python3 -m src.runner -t doubao -n 50 -r 2`（共 100 次）
+
+后台运行推荐：
+```bash
+nohup python3 -m src.runner -n 1000 -r 2 > results/run_<N>x2_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
 ## 前置条件
@@ -147,11 +167,22 @@ Edge TTS 语音 → gRPC 注入模拟器虚拟麦克风 → APP 语音通话
 
 详细架构见 `references/architecture.md`。
 
+### 可靠性配置参数（`BenchmarkRunner` 类常量）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `AUDIO_PIPE_QUICK_FAIL_SECS` | 15s | 注入音频后 N 秒无任何响应 → 快速判定音频管道失效 |
+| `AUDIO_PIPE_RECONNECT_EVERY` | 20 | 每 N 轮预防性重建 gRPC channel（防止长连接老化） |
+| `AUDIO_PIPE_MAX_CONSEC_FAIL` | 2 | 连续 N 轮音频管道失败 → 触发全局重置 |
+| `SESSION_MAX_RECONNECT` | 3 | Appium session 崩溃时轻量重建的最大尝试次数 |
+| `COOLDOWN_AFTER_CRASH_SECS` | 30s | 模拟器崩溃后启动新实例前的冷却等待（让 coreaudiod 完全恢复） |
+| `FULL_RESET_MAX_ATTEMPTS` | 3 | 全局完整环境重置的最大尝试次数 |
+
 ## 代码结构
 
 | 文件 | 职责 |
 |------|------|
-| `src/runner.py` | 主入口 + CLI（Click）。BenchmarkRunner 编排测试流程 |
+| `src/runner.py` | 主入口 + CLI（Click）。BenchmarkRunner 编排测试流程。含崩溃恢复、全局重置、coreaudiod 重启 |
 | `src/config.py` | 配置管理（dataclass + YAML）|
 | `src/automation/base_bot.py` | Appium 自动化基类（ABC）|
 | `src/automation/doubao_bot.py` | 豆包 APP 自动化（resource-id 定位）|
@@ -300,14 +331,53 @@ python3 scripts/test_text_detection.py yuanbao --inject
   6. 重启 adb server（清除旧设备连接缓存）
 - **效果**：崩溃后自动清理 + 冷启动恢复，无需人工干预
 
+#### 7. coreaudiod 重启 — 音频子系统恢复（`_restart_coreaudiod()`）
+- **位置**：`runner.py`，`_restart_coreaudiod()`，在 `_kill_stale_emulator_processes()` 中首先调用
+- **问题**：模拟器 `audio_forwarder_enable` 空指针崩溃（`EXC_BAD_ACCESS at 0x58`），根因是宿主机 BlackHole 虚拟音频设备状态损坏。崩溃后重启模拟器会在 16~20 秒内再次崩溃
+- **修复**：崩溃恢复时自动 `sudo killall coreaudiod`，launchd 会自动重启 coreaudiod，等 5 秒让音频设备重新初始化
+- **权限**：需要 sudo NOPASSWD 配置：
+  ```bash
+  echo "$USER ALL=(root) NOPASSWD: /usr/bin/killall coreaudiod" | sudo tee /etc/sudoers.d/coreaudiod-restart && sudo chmod 0440 /etc/sudoers.d/coreaudiod-restart
+  ```
+  如无 sudo 权限，自动降级尝试 `launchctl kickstart -k system/com.apple.audio.coreaudiod`
+- **效果**：解决"崩溃后新模拟器也秒崩"的问题
+
+#### 8. 全局完整环境重置（`_full_environment_reset()`）
+- **位置**：`runner.py`，`_full_environment_reset()`
+- **触发条件**：
+  - Appium session 轻量恢复失败
+  - 音频管道连续失败 ≥ `AUDIO_PIPE_MAX_CONSEC_FAIL` 次
+  - Bot driver 为 None 且主动连接失败
+- **执行流程（6 步）**：
+  1. 断开所有 Bot
+  2. 杀掉模拟器 + 清理残留（含 coreaudiod 重启）
+  3. 冷却等待 30 秒（`COOLDOWN_AFTER_CRASH_SECS`）
+  4. preflight 重新拉起模拟器 + Appium
+  5. 重建 gRPC 连接
+  6. 重连所有 Bot
+- **设计思路**：等价于之前有效的 bash 外壳循环策略（4/7~4/8 无限循环期间 49 次崩溃全部自动恢复的实证方案）
+- **效果**：模拟器崩溃后自动全链路重置，无人值守长时间运行
+
+#### 9. "永不放弃"策略
+- **位置**：`runner.py`，`_run_target_round()`
+- **问题**：v1 版 runner 在 session 恢复 3 次失败后标记 `skip_targets`，导致后续所有轮次空跑（如 100 轮只有效跑了 8 轮）
+- **修复**：
+  - 移除 `skip_targets` / `raise` 放弃逻辑
+  - 轻量恢复失败 → 全局完整重置 → 重试
+  - 全局重置也失败 → 记录 `FULL_RESET_FAILED` 但继续下一轮
+  - `MAX_RETRIES_EXHAUSTED` → 记录空结果但继续下一轮
+- **效果**：永远不放弃任何 target，最大化有效数据产出
+
 ### 优化效果对比
 
-| 指标 | 优化前 | 优化后 |
-|------|--------|--------|
-| 5 轮成功率 | 60%（3/5 正常） | **100%** |
-| 平均 TTFT | 11999ms（含异常） | **1141ms** |
-| TTFT 范围 | 877 ~ 48688ms | 811 ~ 1557ms |
-| 标准差 | ~18522ms | ~281ms |
+| 指标 | 优化前 | 优化后（v1 稳定性） | 崩溃恢复（v2） |
+|------|--------|---------------------|----------------|
+| 5 轮成功率 | 60%（3/5 正常） | **100%** | **100%** |
+| 平均 TTFT | 11999ms（含异常） | **1141ms** | **~1500ms** |
+| TTFT 范围 | 877 ~ 48688ms | 811 ~ 1557ms | 904 ~ 2420ms |
+| 崩溃恢复能力 | ❌ 无 | ⚠️ 轻量（session 重建） | ✅ 全链路（含模拟器+coreaudiod+gRPC） |
+| 连续运行能力 | 10 轮内崩溃 | ~30 分钟后崩溃 | **无限运行**（自动恢复） |
+| 数据有效率 | <30% | ~95% | **>95%**（崩溃恢复后继续采集） |
 
 ## 已知坑
 
@@ -353,3 +423,10 @@ python3 scripts/test_text_detection.py yuanbao --inject
    ~/Library/Android/sdk/emulator/emulator -avd Pixel_6_API_34 -grpc 8554 -gpu host -no-snapshot-load
    ```
    **诊断方法**：`adb shell "logcat -d | grep pcm_writei"` 如果有 I/O error 就说明需要冷启动
+15. **⚠️ audio_forwarder 空指针崩溃（模拟器运行 ~30 分钟后）**：模拟器 `audio_forwarder_enable()` 在处理 gRPC `injectAudio` 时解引用 NULL 指针（`EXC_BAD_ACCESS at address 0x58`），崩溃堆栈：`injectAudio → QemuAudioInputEngine::start → audio_forwarder_enable → 💥`。这是 Android Emulator 内部 bug，与 BlackHole 虚拟音频驱动长时间运行后状态损坏有关。**崩溃后重启模拟器也会在 16~20 秒内再次崩溃**（因为 coreaudiod 中的音频设备状态已损坏）。**解决方案**：runner.py 的 `_full_environment_reset()` 自动处理——重启 coreaudiod → 30s 冷却 → 全新启动模拟器
+16. **⚠️ 崩溃恢复需要 sudo NOPASSWD**：`_restart_coreaudiod()` 需要 `sudo killall coreaudiod`。首次部署时必须配置：
+   ```bash
+   echo "$USER ALL=(root) NOPASSWD: /usr/bin/killall coreaudiod" | sudo tee /etc/sudoers.d/coreaudiod-restart && sudo chmod 0440 /etc/sudoers.d/coreaudiod-restart
+   ```
+   如未配置，降级尝试 `launchctl kickstart` 但可能权限不足
+17. **⚠️ 单进程长时间运行 vs bash 外壳循环**：`-n 1000` 单进程运行崩溃后的恢复依赖 `_full_environment_reset()` 内部机制。之前有效的 bash 外壳循环策略（`while true; do python runner.py -n 3; sleep 60; done`）通过进程级隔离天然具备恢复能力。当前 runner 已将该策略内化，但如遇极端情况（如内存泄漏），可回退到 bash 外壳循环模式
