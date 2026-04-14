@@ -1331,14 +1331,43 @@ class BenchmarkRunner:
             logger.error(f"❌ [FullReset] gRPC 重建失败: {e}")
             self._injector_connected = False
 
-        # 6. 重连所有 bot
+        # 5.5 gRPC 重连可能耗时较长，再次验证 adb 设备就绪
+        #     （重连期间设备状态可能变化）
+        if not self._wait_for_adb_device(timeout=60):
+            logger.error("❌ [FullReset] adb 设备在 gRPC 重连后变为不可用")
+            return False
+
+        # 6. 重连所有 bot（带重试：设备刚就绪时 Appium 可能短暂找不到设备）
+        BOT_CONNECT_MAX_RETRIES = 3
+        BOT_CONNECT_RETRY_DELAY = 15  # 每次重试前等待秒数
         all_ok = True
         for target, bot in bots.items():
-            try:
-                bot.connect()
-                logger.info(f"✅ [FullReset] [{target}] Bot 已重连")
-            except Exception as e:
-                logger.error(f"❌ [FullReset] [{target}] Bot 重连失败: {e}")
+            connected = False
+            for attempt in range(1, BOT_CONNECT_MAX_RETRIES + 1):
+                try:
+                    bot.connect()
+                    logger.info(f"✅ [FullReset] [{target}] Bot 已重连")
+                    connected = True
+                    break
+                except Exception as e:
+                    if attempt < BOT_CONNECT_MAX_RETRIES:
+                        logger.warning(
+                            f"⚠️ [FullReset] [{target}] Bot 重连失败 "
+                            f"(尝试 {attempt}/{BOT_CONNECT_MAX_RETRIES}): {e}"
+                        )
+                        logger.info(
+                            f"⏳ [FullReset] 等待 {BOT_CONNECT_RETRY_DELAY}s "
+                            f"后重试..."
+                        )
+                        time.sleep(BOT_CONNECT_RETRY_DELAY)
+                        # 重试前再验证 adb 设备
+                        self._wait_for_adb_device(timeout=30)
+                    else:
+                        logger.error(
+                            f"❌ [FullReset] [{target}] Bot 重连失败 "
+                            f"(已重试 {BOT_CONNECT_MAX_RETRIES} 次): {e}"
+                        )
+            if not connected:
                 all_ok = False
 
         if all_ok:
