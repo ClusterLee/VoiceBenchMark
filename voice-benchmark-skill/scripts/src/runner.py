@@ -3,11 +3,12 @@
 Voice Latency Benchmark — 主运行脚本
 
 用法:
-    python3 runner.py                     # 使用默认配置
-    python3 runner.py -c configs/cn.yaml  # 指定配置文件
-    python3 runner.py --targets yuanbao   # 只测元宝
-    python3 runner.py --rounds 10         # 10 轮测试
-    python3 runner.py --inspect yuanbao   # 调试模式：获取元素树
+    python3 runner.py                        # 使用默认配置
+    python3 runner.py -c configs/cn.yaml     # 指定配置文件
+    python3 runner.py --targets yuanbao      # 只测元宝
+    python3 runner.py -n 10                  # 10 大轮测试
+    python3 runner.py -n 100 -r 2            # 100 大轮，每轮元宝×2 + 豆包×2 = 400 次
+    python3 runner.py --inspect yuanbao      # 调试模式：获取元素树
 """
 import os
 import sys
@@ -1103,8 +1104,199 @@ class BenchmarkRunner:
                 is_valid=False, error_msg=str(e),
             )
 
-    def run(self, targets: List[str] = None):
-        """运行完整测试"""
+    def _run_target_round(
+        self, target: str, round_num: int, sub_round: int,
+        bot, session_reconnect_counts: Dict[str, int],
+    ) -> Optional[LatencyResult]:
+        """执行单个 target 的一次测试（含错误恢复）
+
+        Args:
+            target: 测试目标名
+            round_num: 大轮号 (0-based)
+            sub_round: 大轮内的子轮号 (0-based)
+            bot: 已连接的 Bot 实例
+            session_reconnect_counts: 各 target 的 session 重连计数
+
+        Returns:
+            LatencyResult 或 None（需要重试当前轮）
+        """
+        # 全局轮序号（用于 gRPC 预防重建判断）
+        global_round = round_num * 2 + sub_round  # 每轮每 target 2 次
+
+        # ── 预防性 gRPC 重建（每 N 轮）──
+        if self._should_reconnect_grpc(global_round):
+            logger.info(
+                f"[{target}] 🔄 预防性重建 gRPC 连接 "
+                f"(每 {self.AUDIO_PIPE_RECONNECT_EVERY} 轮)"
+            )
+            self.injector.reconnect()
+            self._injector_connected = True
+
+        # ── 执行单轮测试 ──
+        try:
+            result = self.run_single_round(target, round_num, bot)
+        except Exception as e:
+            err_msg = str(e)
+            # ── Appium Session 崩溃自动恢复 ──
+            if ("session" in err_msg.lower()
+                    or "InvalidSessionId" in err_msg
+                    or "device not found" in err_msg
+                    or "instrumentation process is not running" in err_msg
+                    or "cannot be proxied" in err_msg):
+
+                count = session_reconnect_counts.get(target, 0)
+                if count < self.SESSION_MAX_RECONNECT:
+                    session_reconnect_counts[target] = count + 1
+                    logger.warning(
+                        f"[{target}] 🔧 Appium session 崩溃 "
+                        f"(恢复 #{count+1}/"
+                        f"{self.SESSION_MAX_RECONNECT}): {err_msg[:80]}"
+                    )
+                    if self._reconnect_appium_session(bot):
+                        logger.info(
+                            f"[{target}] ♻️ 重试第 {round_num+1} 轮"
+                        )
+                        return None  # 信号：重试当前轮
+                    else:
+                        # Session 恢复失败 → 检查是否模拟器挂了
+                        if not self._is_emulator_running():
+                            logger.warning(
+                                f"[{target}] 🔧 模拟器已崩溃，"
+                                f"尝试完整环境恢复..."
+                            )
+                            if self.preflight_check():
+                                logger.info(
+                                    f"[{target}] ✅ 环境恢复成功，"
+                                    f"重建 Appium session..."
+                                )
+                                try:
+                                    self.injector.reconnect()
+                                    self._injector_connected = True
+                                except Exception:
+                                    pass
+                                if self._reconnect_appium_session(bot):
+                                    logger.info(
+                                        f"[{target}] ♻️ 模拟器恢复后"
+                                        f"重试第 {round_num+1} 轮"
+                                    )
+                                    return None  # 信号：重试
+                        logger.error(
+                            f"[{target}] ❌ Session 恢复失败"
+                        )
+                        raise  # 向上抛，让调用者跳过此 target
+                else:
+                    logger.error(
+                        f"[{target}] ❌ Session 已恢复 "
+                        f"{self.SESSION_MAX_RECONNECT} 次仍失败"
+                    )
+                    raise
+            else:
+                # 非 session 错误，记录并继续
+                result = LatencyResult(
+                    e2e_latency=0, ttfr=0,
+                    total_response_time=0,
+                    user_speech_start=0, user_speech_end=0,
+                    ai_speech_start=0, ai_speech_end=0,
+                    target=target, round_num=round_num,
+                    is_valid=False, error_msg=str(e),
+                )
+
+        # ── 音频管道失效检测 + 自动恢复 ──
+        if (hasattr(result, 'error_msg')
+                and result.error_msg
+                and "AUDIO_PIPE_DEAD" in result.error_msg):
+            self._consecutive_audio_failures += 1
+            logger.warning(
+                f"[{target}] 连续音频失败: "
+                f"{self._consecutive_audio_failures}/"
+                f"{self.AUDIO_PIPE_MAX_CONSEC_FAIL}"
+            )
+
+            # 第一次失败就立即重建 gRPC 并重试
+            if self._consecutive_audio_failures == 1:
+                logger.info(
+                    f"[{target}] 🔄 首次管道失效，快速重建 gRPC 并重试..."
+                )
+                try:
+                    self.injector.reconnect()
+                    self._injector_connected = True
+                except Exception as e:
+                    logger.error(f"[{target}] gRPC 快速重建失败: {e}")
+                    self._injector_connected = False
+                try:
+                    bot.end_voice_call()
+                except Exception:
+                    pass
+                time.sleep(3)
+                return None  # 信号：重试
+
+            if self._consecutive_audio_failures >= self.AUDIO_PIPE_MAX_CONSEC_FAIL:
+                if self._recover_audio_pipeline(bot):
+                    logger.info(
+                        f"[{target}] ♻️ 管道恢复后重试"
+                        f"第 {round_num+1} 轮"
+                    )
+                    bot.reset_app()
+                    time.sleep(5)
+                    return None  # 信号：重试
+                else:
+                    logger.error(
+                        f"[{target}] ❌ 管道恢复失败，记录失败并继续"
+                    )
+            return result  # 管道失败的结果
+
+        # ── 成功或非管道失败 ──
+        if result.is_valid:
+            self._consecutive_audio_failures = 0
+            session_reconnect_counts[target] = 0
+
+        # 异常值检测 + 自动重试（最多 1 次）
+        ttft_ms = result.ttfr * 1000 if result.is_valid else 0
+        if result.is_valid and self._is_ttft_outlier(ttft_ms):
+            logger.warning(
+                f"[{target}] ⚠️ Round {round_num} "
+                f"TTFT={ttft_ms:.0f}ms 异常! "
+                f"(>{8000}ms)，标记为无效并自动重试..."
+            )
+            result.is_valid = False
+            result.error_msg = f"TTFT outlier: {ttft_ms:.0f}ms"
+            self.results[target].append(result)
+
+            logger.info(f"[{target}] 重置 APP 准备重试...")
+            bot.reset_app()
+            time.sleep(self.config.benchmark.round_interval + 2)
+
+            retry_result = self.run_single_round(target, round_num, bot)
+            retry_ttft = (
+                retry_result.ttfr * 1000 if retry_result.is_valid else 0
+            )
+            if retry_result.is_valid and not self._is_ttft_outlier(retry_ttft):
+                logger.info(
+                    f"[{target}] ✅ 重试成功! TTFT={retry_ttft:.0f}ms"
+                )
+            else:
+                logger.warning(
+                    f"[{target}] 重试仍异常 (TTFT={retry_ttft:.0f}ms)，"
+                    f"保留结果"
+                )
+            return retry_result
+
+        return result
+
+    def run(self, targets: List[str] = None, repeat_per_round: int = 1):
+        """运行完整测试
+
+        交替模式：每大轮按 target 顺序轮流测试，每个 target 测 repeat_per_round 次。
+        例如 targets=[yuanbao, doubao], repeat_per_round=2, rounds=100:
+          大轮 1: yuanbao×2, doubao×2
+          大轮 2: yuanbao×2, doubao×2
+          ...
+          共 100 轮 × 2 target × 2 repeat = 400 次测试
+
+        Args:
+            targets: 测试目标列表
+            repeat_per_round: 每大轮每个 target 测试次数，默认 1
+        """
         if targets is None:
             targets = list(self.config.apps.keys())
 
@@ -1113,237 +1305,97 @@ class BenchmarkRunner:
             logger.error("❌ 环境预检失败，终止测试")
             return {}
 
+        total_tests = self.config.benchmark.num_rounds * len(targets) * repeat_per_round
         logger.info(f"🎙️ Voice Latency Benchmark 开始")
         logger.info(f"   目标: {targets}")
-        logger.info(f"   轮次: {self.config.benchmark.num_rounds}")
+        logger.info(f"   大轮次: {self.config.benchmark.num_rounds}")
+        logger.info(f"   每轮每 target 重复: {repeat_per_round} 次")
+        logger.info(f"   总测试数: {total_tests}")
         logger.info(f"   节点: {self.config.node_id} ({self.config.node_region})")
-        logger.info(f"   方案: gRPC EmulatorMicInjector")
+        logger.info(f"   方案: gRPC EmulatorMicInjector (交替模式)")
         logger.info(f"   可靠性: 快速失败={self.AUDIO_PIPE_QUICK_FAIL_SECS}s, "
                      f"预防重建=每{self.AUDIO_PIPE_RECONNECT_EVERY}轮, "
                      f"连续失败恢复阈值={self.AUDIO_PIPE_MAX_CONSEC_FAIL}")
 
+        # 初始化各 target 的 bot 和状态
+        bots: Dict[str, object] = {}
+        session_reconnect_counts: Dict[str, int] = {}
+        skip_targets = set()
+
+        for target in targets:
+            self.results[target] = []
+            session_reconnect_counts[target] = 0
+
         try:
+            # 预先连接所有 bot
             for target in targets:
+                try:
+                    bot = self._get_bot(target)
+                    bot.connect()
+                    bots[target] = bot
+                    logger.info(f"✅ [{target}] Bot 已连接")
+                except Exception as e:
+                    logger.error(f"❌ [{target}] Bot 连接失败: {e}")
+                    skip_targets.add(target)
+
+            # ── 交替测试主循环 ──
+            for round_num in range(self.config.benchmark.num_rounds):
                 logger.info(f"\n{'#'*60}")
-                logger.info(f"# 开始测试: {target}")
+                logger.info(
+                    f"# 大轮 {round_num + 1}/{self.config.benchmark.num_rounds}"
+                )
                 logger.info(f"{'#'*60}")
 
-                self.results[target] = []
-                bot = self._get_bot(target)
-                self._consecutive_audio_failures = 0
-                session_reconnect_count = 0
+                for target in targets:
+                    if target in skip_targets:
+                        continue
 
-                try:
-                    bot.connect()
+                    bot = bots[target]
+                    self._consecutive_audio_failures = 0
 
-                    round_num = 0
-                    while round_num < self.config.benchmark.num_rounds:
-                        # 记录本轮开始前 results 长度（用于上报）
+                    for sub in range(repeat_per_round):
+                        logger.info(
+                            f"\n>>> [{target}] 大轮 {round_num+1} "
+                            f"子轮 {sub+1}/{repeat_per_round}"
+                        )
+
                         _round_start_idx = len(self.results[target])
-
-                        # ── 预防性 gRPC 重建（每 N 轮）──
-                        if self._should_reconnect_grpc(round_num):
-                            logger.info(
-                                f"[{target}] 🔄 预防性重建 gRPC 连接 "
-                                f"(每 {self.AUDIO_PIPE_RECONNECT_EVERY} 轮)"
-                            )
-                            self.injector.reconnect()
-                            self._injector_connected = True
-
-                        # ── 执行单轮测试 ──
-                        try:
-                            result = self.run_single_round(target, round_num, bot)
-                        except Exception as e:
-                            err_msg = str(e)
-                            # ── Appium Session 崩溃自动恢复 ──
-                            if ("session" in err_msg.lower()
-                                    or "InvalidSessionId" in err_msg
-                                    or "device not found" in err_msg
-                                    or "instrumentation process is not running" in err_msg
-                                    or "cannot be proxied" in err_msg):
-
-                                if session_reconnect_count < self.SESSION_MAX_RECONNECT:
-                                    session_reconnect_count += 1
-                                    logger.warning(
-                                        f"[{target}] 🔧 Appium session 崩溃 "
-                                        f"(恢复 #{session_reconnect_count}/"
-                                        f"{self.SESSION_MAX_RECONNECT}): {err_msg[:80]}"
-                                    )
-                                    if self._reconnect_appium_session(bot):
-                                        # session 恢复成功，重试当前轮
-                                        logger.info(
-                                            f"[{target}] ♻️ 重试第 {round_num+1} 轮"
-                                        )
-                                        continue
-                                    else:
-                                        # Session 恢复失败 → 检查是否模拟器挂了
-                                        if not self._is_emulator_running():
-                                            logger.warning(
-                                                f"[{target}] 🔧 模拟器已崩溃，"
-                                                f"尝试完整环境恢复..."
-                                            )
-                                            if self.preflight_check():
-                                                logger.info(
-                                                    f"[{target}] ✅ 环境恢复成功，"
-                                                    f"重建 Appium session..."
-                                                )
-                                                # 重建 gRPC 连接
-                                                try:
-                                                    self.injector.reconnect()
-                                                    self._injector_connected = True
-                                                except Exception:
-                                                    pass
-                                                if self._reconnect_appium_session(bot):
-                                                    logger.info(
-                                                        f"[{target}] ♻️ 模拟器恢复后"
-                                                        f"重试第 {round_num+1} 轮"
-                                                    )
-                                                    continue
-                                        logger.error(
-                                            f"[{target}] ❌ Session 恢复失败，"
-                                            f"跳过后续轮次"
-                                        )
-                                        break
-                                else:
-                                    logger.error(
-                                        f"[{target}] ❌ Session 已恢复 "
-                                        f"{self.SESSION_MAX_RECONNECT} 次仍失败，"
-                                        f"终止测试"
-                                    )
-                                    break
-                            else:
-                                # 非 session 错误，记录并继续
-                                result = LatencyResult(
-                                    e2e_latency=0, ttfr=0,
-                                    total_response_time=0,
-                                    user_speech_start=0, user_speech_end=0,
-                                    ai_speech_start=0, ai_speech_end=0,
-                                    target=target, round_num=round_num,
-                                    is_valid=False, error_msg=str(e),
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                result = self._run_target_round(
+                                    target, round_num, sub, bot,
+                                    session_reconnect_counts,
                                 )
-
-                        # ── 音频管道失效检测 + 自动恢复 ──
-                        if (hasattr(result, 'error_msg')
-                                and result.error_msg
-                                and "AUDIO_PIPE_DEAD" in result.error_msg):
-                            self._consecutive_audio_failures += 1
-                            logger.warning(
-                                f"[{target}] 连续音频失败: "
-                                f"{self._consecutive_audio_failures}/"
-                                f"{self.AUDIO_PIPE_MAX_CONSEC_FAIL}"
-                            )
-
-                            # 第一次失败就立即重建 gRPC 并重试
-                            # （不记录失败结果，直接重试当前轮）
-                            if self._consecutive_audio_failures == 1:
-                                logger.info(
-                                    f"[{target}] 🔄 首次管道失效，快速重建 gRPC 并重试..."
+                            except Exception:
+                                # session/模拟器恢复彻底失败
+                                skip_targets.add(target)
+                                logger.error(
+                                    f"[{target}] ❌ 不可恢复错误，跳过此 target"
                                 )
-                                try:
-                                    self.injector.reconnect()
-                                    self._injector_connected = True
-                                except Exception as e:
-                                    logger.error(f"[{target}] gRPC 快速重建失败: {e}")
-                                    self._injector_connected = False
-                                # 结束当前通话，重试当前轮
-                                try:
-                                    bot.end_voice_call()
-                                except Exception:
-                                    pass
-                                time.sleep(3)
+                                break
+
+                            if result is None:
+                                # 需要重试
                                 continue
-
-                            if self._consecutive_audio_failures >= self.AUDIO_PIPE_MAX_CONSEC_FAIL:
-                                # 连续失败 → 完整恢复流程（含 reset_app）
-                                if self._recover_audio_pipeline(bot):
-                                    logger.info(
-                                        f"[{target}] ♻️ 管道恢复后重试"
-                                        f"第 {round_num+1} 轮"
-                                    )
-                                    bot.reset_app()
-                                    time.sleep(5)
-                                    continue
-                                else:
-                                    logger.error(
-                                        f"[{target}] ❌ 管道恢复失败，"
-                                        f"记录失败并继续"
-                                    )
-                            self.results[target].append(result)
-                        else:
-                            # 成功或非管道失败 → 重置连续失败计数
-                            if result.is_valid:
-                                self._consecutive_audio_failures = 0
-                                session_reconnect_count = 0  # 成功轮也重置 session 计数
-
-                            # 异常值检测 + 自动重试（最多 1 次）
-                            ttft_ms = result.ttfr * 1000 if result.is_valid else 0
-                            if result.is_valid and self._is_ttft_outlier(ttft_ms):
-                                logger.warning(
-                                    f"[{target}] ⚠️ Round {round_num} "
-                                    f"TTFT={ttft_ms:.0f}ms 异常! "
-                                    f"(>{8000}ms)，标记为无效并自动重试..."
-                                )
-                                result.is_valid = False
-                                result.error_msg = (
-                                    f"TTFT outlier: {ttft_ms:.0f}ms"
-                                )
-                                self.results[target].append(result)
-
-                                # 重置 APP 后重试
-                                logger.info(
-                                    f"[{target}] 重置 APP 准备重试..."
-                                )
-                                bot.reset_app()
-                                time.sleep(
-                                    self.config.benchmark.round_interval + 2
-                                )
-
-                                retry_result = self.run_single_round(
-                                    target, round_num, bot
-                                )
-                                retry_ttft = (
-                                    retry_result.ttfr * 1000
-                                    if retry_result.is_valid else 0
-                                )
-                                if (retry_result.is_valid
-                                        and not self._is_ttft_outlier(
-                                            retry_ttft)):
-                                    logger.info(
-                                        f"[{target}] ✅ 重试成功! "
-                                        f"TTFT={retry_ttft:.0f}ms"
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"[{target}] 重试仍异常 "
-                                        f"(TTFT={retry_ttft:.0f}ms)，"
-                                        f"保留结果"
-                                    )
-                                self.results[target].append(retry_result)
                             else:
                                 self.results[target].append(result)
-
-                        # 多轮测试: 强杀 APP 再冷启动
-                        if round_num < self.config.benchmark.num_rounds - 1:
-                            logger.info(
-                                f"[{target}] 重置 APP (清除上下文)..."
+                                break
+                        else:
+                            # max_retries 用完
+                            logger.error(
+                                f"[{target}] ❌ 重试 {max_retries} 次仍失败"
                             )
-                            bot.reset_app()
-                            wait = self.config.benchmark.round_interval
-                            logger.info(f"等待 {wait}s 后进行下一轮...")
-                            time.sleep(wait)
 
-                        # ── 单轮实时上报（含失败轮次）──
+                        # ── 单轮实时上报 ──
                         if self._cloud_uploader:
-                            # 上报本轮新增的所有 results
                             new_results = self.results[target][
                                 _round_start_idx:
                             ]
                             for r in new_results:
                                 try:
                                     self._cloud_uploader.upload_round(
-                                        r,
-                                        target,
-                                        round_num,
+                                        r, target, round_num,
                                         node_id=self.config.node_id,
                                         node_region=self.config.node_region,
                                     )
@@ -1353,14 +1405,32 @@ class BenchmarkRunner:
                                         f" 上报异常: {e}"
                                     )
 
-                        round_num += 1
+                        # 子轮间重置 APP
+                        if sub < repeat_per_round - 1:
+                            logger.info(
+                                f"[{target}] 重置 APP (子轮间)..."
+                            )
+                            bot.reset_app()
+                            time.sleep(self.config.benchmark.round_interval)
 
-                except Exception as e:
-                    logger.error(f"[{target}] 测试中断: {e}")
-                finally:
-                    bot.disconnect()
+                    # target 间切换：重置当前 APP
+                    if target not in skip_targets:
+                        bot.reset_app()
+                        time.sleep(self.config.benchmark.round_interval)
+
+                # 大轮间等待
+                if round_num < self.config.benchmark.num_rounds - 1:
+                    logger.info(f"⏸️ 大轮间等待 {self.config.benchmark.round_interval}s...")
+                    time.sleep(self.config.benchmark.round_interval)
 
         finally:
+            # 断开所有 bot
+            for target, bot in bots.items():
+                try:
+                    bot.disconnect()
+                except Exception:
+                    pass
+
             # 清理 gRPC 连接
             if self._injector_connected:
                 self.injector.disconnect()
@@ -1433,10 +1503,16 @@ def inspect_mode(target: str, config: Config):
 @click.command()
 @click.option("-c", "--config", "config_path", default=None, help="配置文件路径")
 @click.option("-t", "--targets", default=None, help="测试目标 (逗号分隔)")
-@click.option("-n", "--rounds", default=None, type=int, help="测试轮次")
+@click.option("-n", "--rounds", default=None, type=int, help="测试轮次（大轮数）")
+@click.option("-r", "--repeat", default=1, type=int, help="每大轮每 target 重复次数 (默认 1)")
 @click.option("--inspect", default=None, help="调试模式：获取指定 APP 的 UI 元素树")
-def main(config_path, targets, rounds, inspect):
-    """🎙️ Voice Latency Benchmark — AI 语音通话延迟评测工具"""
+def main(config_path, targets, rounds, repeat, inspect):
+    """🎙️ Voice Latency Benchmark — AI 语音通话延迟评测工具
+
+    交替模式示例:
+        python3 runner.py -n 100 -r 2
+        # 100 大轮，每轮 yuanbao×2 + doubao×2 = 400 次测试
+    """
 
     # 配置日志
     logger.remove()
@@ -1461,7 +1537,7 @@ def main(config_path, targets, rounds, inspect):
 
     # 运行测试
     runner = BenchmarkRunner(config)
-    report_files = runner.run(target_list)
+    report_files = runner.run(target_list, repeat_per_round=repeat)
 
     logger.info(f"\n🏁 测试完成！报告文件:")
     for fmt, path in report_files.items():
