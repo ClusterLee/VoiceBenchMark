@@ -198,6 +198,48 @@ class BenchmarkRunner:
         except Exception:
             return False
 
+    @staticmethod
+    def _restart_coreaudiod() -> None:
+        """重启 macOS coreaudiod 守护进程，重置宿主机音频子系统
+
+        模拟器崩溃后 BlackHole 虚拟音频设备状态可能损坏，
+        导致新模拟器的 audio_forwarder_enable 空指针崩溃。
+        重启 coreaudiod 可重置所有音频设备状态。
+
+        注意：需要 sudo 权限。如果没有无密码 sudo，此操作会跳过。
+        """
+        logger.info("🔊 [AudioReset] 重启 coreaudiod 以重置音频子系统...")
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "killall", "coreaudiod"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                # coreaudiod 会被 launchd 自动重启，等待其恢复
+                time.sleep(5)
+                logger.info("✅ [AudioReset] coreaudiod 已重启")
+            else:
+                # sudo 无密码权限不足，尝试无 sudo 方式
+                logger.warning(
+                    f"⚠️ [AudioReset] sudo killall 失败 (rc={result.returncode})，"
+                    f"尝试 launchctl kickstart..."
+                )
+                result2 = subprocess.run(
+                    ["launchctl", "kickstart", "-k",
+                     "system/com.apple.audio.coreaudiod"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result2.returncode == 0:
+                    time.sleep(5)
+                    logger.info("✅ [AudioReset] coreaudiod 已通过 launchctl 重启")
+                else:
+                    logger.warning(
+                        "⚠️ [AudioReset] 无法重启 coreaudiod（需要 sudo 权限），"
+                        "跳过音频重置"
+                    )
+        except Exception as e:
+            logger.warning(f"⚠️ [AudioReset] coreaudiod 重启异常: {e}")
+
     @classmethod
     def _kill_stale_emulator_processes(cls) -> None:
         """清理残留的模拟器进程（qemu、crashpad_handler）和 adb server
@@ -206,6 +248,9 @@ class BenchmarkRunner:
         导致新模拟器无法正常启动。此方法在启动前强制清理。
         """
         import signal
+
+        # 0. 重启 coreaudiod（修复音频子系统状态）
+        cls._restart_coreaudiod()
 
         # 1. 杀残留 qemu 进程
         try:
@@ -365,12 +410,14 @@ class BenchmarkRunner:
                     f"仍未注册到 adb，判定为僵尸进程，清理后重启..."
                 )
                 cls._kill_stale_emulator_processes()
-                return cls._launch_new_emulator(avd_name, grpc_port, timeout)
+                return cls._launch_new_emulator(avd_name, grpc_port, timeout,
+                                                after_crash=True)
         else:
             # ── 情况 3: qemu 不存在 → 清理残留 + 启动新模拟器 ──
             logger.info("🧹 [Preflight] 无 qemu 进程，清理残留后启动新模拟器...")
             cls._kill_stale_emulator_processes()
-            return cls._launch_new_emulator(avd_name, grpc_port, timeout)
+            return cls._launch_new_emulator(avd_name, grpc_port, timeout,
+                                            after_crash=True)
 
         # ── 等待 boot_completed（情况 1 & 2 走到这里）──
         t_start = time.time()
@@ -393,7 +440,8 @@ class BenchmarkRunner:
                 remaining = timeout - elapsed
                 if remaining > 60:
                     return cls._launch_new_emulator(
-                        avd_name, grpc_port, remaining
+                        avd_name, grpc_port, remaining,
+                        after_crash=True
                     )
                 else:
                     logger.error(
@@ -407,19 +455,32 @@ class BenchmarkRunner:
         )
         return False
 
+    # ── 冷却配置 ──
+    COOLDOWN_AFTER_CRASH_SECS = 30  # 崩溃恢复后冷却等待秒数
+
     @classmethod
     def _launch_new_emulator(cls, avd_name: str, grpc_port: int,
-                             timeout: float) -> bool:
+                             timeout: float,
+                             after_crash: bool = False) -> bool:
         """启动全新模拟器进程并等待 boot 完成（内部方法）
 
         Args:
             avd_name: AVD 名称
             grpc_port: gRPC 端口
             timeout: 最大等待时间
+            after_crash: 是否在崩溃后调用（控制冷却等待）
 
         Returns:
             True = 启动成功, False = 超时/失败
         """
+        # ── 崩溃后冷却等待（让 coreaudiod 完全恢复） ──
+        if after_crash:
+            logger.info(
+                f"❄️ [Cooldown] 崩溃后冷却 {cls.COOLDOWN_AFTER_CRASH_SECS}s，"
+                f"等待音频子系统完全恢复..."
+            )
+            time.sleep(cls.COOLDOWN_AFTER_CRASH_SECS)
+
         emu = cls._find_emulator()
         logger.info(
             f"🚀 [Preflight] 启动模拟器: {emu} -avd {avd_name} "
@@ -1104,11 +1165,86 @@ class BenchmarkRunner:
                 is_valid=False, error_msg=str(e),
             )
 
+    # ── 全局重置配置 ──
+    FULL_RESET_MAX_ATTEMPTS = 3    # 全局重置最大尝试次数
+
+    def _full_environment_reset(self, bots: Dict[str, object]) -> bool:
+        """全局完整环境重置（等同于之前 bash 循环的新批次效果）
+
+        执行步骤：
+        1. 断开所有 bot
+        2. 杀掉模拟器 + 清理残留（含 coreaudiod 重启）
+        3. 冷却等待 30s
+        4. preflight 重新拉起模拟器 + Appium
+        5. 重建 gRPC 连接
+        6. 重连所有 bot
+
+        Returns:
+            True = 恢复成功, False = 彻底失败
+        """
+        logger.warning("🔄🔄🔄 [FullReset] 开始全局完整环境重置...")
+
+        # 1. 断开所有 bot（忽略错误）
+        for target, bot in bots.items():
+            try:
+                bot.disconnect()
+            except Exception:
+                pass
+
+        # 2. 杀掉残留进程（内含 coreaudiod 重启）
+        self._kill_stale_emulator_processes()
+
+        # 3. 冷却等待
+        logger.info(
+            f"❄️ [FullReset] 冷却 {self.COOLDOWN_AFTER_CRASH_SECS}s，"
+            f"等待音频子系统完全恢复..."
+        )
+        time.sleep(self.COOLDOWN_AFTER_CRASH_SECS)
+
+        # 4. preflight 重新拉起环境
+        if not self.preflight_check():
+            logger.error("❌ [FullReset] 环境预检失败")
+            return False
+
+        # 5. 重建 gRPC 连接
+        try:
+            self.injector.reconnect()
+            self._injector_connected = True
+            logger.info("✅ [FullReset] gRPC 连接已重建")
+        except Exception as e:
+            logger.error(f"❌ [FullReset] gRPC 重建失败: {e}")
+            self._injector_connected = False
+
+        # 6. 重连所有 bot
+        all_ok = True
+        for target, bot in bots.items():
+            try:
+                bot.connect()
+                logger.info(f"✅ [FullReset] [{target}] Bot 已重连")
+            except Exception as e:
+                logger.error(f"❌ [FullReset] [{target}] Bot 重连失败: {e}")
+                all_ok = False
+
+        if all_ok:
+            logger.info("✅✅✅ [FullReset] 全局环境重置完成！")
+        else:
+            logger.warning("⚠️ [FullReset] 部分 Bot 重连失败")
+
+        # 重置计数器
+        self._consecutive_audio_failures = 0
+        return all_ok
+
     def _run_target_round(
         self, target: str, round_num: int, sub_round: int,
         bot, session_reconnect_counts: Dict[str, int],
+        bots: Dict[str, object] = None,
     ) -> Optional[LatencyResult]:
         """执行单个 target 的一次测试（含错误恢复）
+
+        核心策略变更（v2 崩溃修复）：
+        - 移除"不可恢复 → 跳过 target"逻辑
+        - Session 恢复失败时，执行全局完整重置（等同于 bash 循环的新批次）
+        - 音频管道连续失败时，也触发全局重置而不是放弃
 
         Args:
             target: 测试目标名
@@ -1116,6 +1252,7 @@ class BenchmarkRunner:
             sub_round: 大轮内的子轮号 (0-based)
             bot: 已连接的 Bot 实例
             session_reconnect_counts: 各 target 的 session 重连计数
+            bots: 所有 bot 实例的字典（全局重置时需要断开/重连所有 bot）
 
         Returns:
             LatencyResult 或 None（需要重试当前轮）
@@ -1157,39 +1294,32 @@ class BenchmarkRunner:
                             f"[{target}] ♻️ 重试第 {round_num+1} 轮"
                         )
                         return None  # 信号：重试当前轮
-                    else:
-                        # Session 恢复失败 → 检查是否模拟器挂了
-                        if not self._is_emulator_running():
-                            logger.warning(
-                                f"[{target}] 🔧 模拟器已崩溃，"
-                                f"尝试完整环境恢复..."
-                            )
-                            if self.preflight_check():
-                                logger.info(
-                                    f"[{target}] ✅ 环境恢复成功，"
-                                    f"重建 Appium session..."
-                                )
-                                try:
-                                    self.injector.reconnect()
-                                    self._injector_connected = True
-                                except Exception:
-                                    pass
-                                if self._reconnect_appium_session(bot):
-                                    logger.info(
-                                        f"[{target}] ♻️ 模拟器恢复后"
-                                        f"重试第 {round_num+1} 轮"
-                                    )
-                                    return None  # 信号：重试
-                        logger.error(
-                            f"[{target}] ❌ Session 恢复失败"
-                        )
-                        raise  # 向上抛，让调用者跳过此 target
-                else:
-                    logger.error(
-                        f"[{target}] ❌ Session 已恢复 "
-                        f"{self.SESSION_MAX_RECONNECT} 次仍失败"
+
+                # ── 轻量恢复失败 → 全局完整重置 ──
+                logger.warning(
+                    f"[{target}] 🔧 Session 轻量恢复失败，"
+                    f"执行全局完整重置..."
+                )
+                if bots and self._full_environment_reset(bots):
+                    session_reconnect_counts[target] = 0
+                    logger.info(
+                        f"[{target}] ♻️ 全局重置后重试第 {round_num+1} 轮"
                     )
-                    raise
+                    return None  # 信号：重试
+                else:
+                    # 全局重置也失败了，记录失败但不跳过 target
+                    logger.error(
+                        f"[{target}] ❌ 全局重置失败，记录失败继续下一轮"
+                    )
+                    return LatencyResult(
+                        e2e_latency=0, ttfr=0,
+                        total_response_time=0,
+                        user_speech_start=0, user_speech_end=0,
+                        ai_speech_start=0, ai_speech_end=0,
+                        target=target, round_num=round_num,
+                        is_valid=False,
+                        error_msg=f"FULL_RESET_FAILED: {err_msg[:100]}",
+                    )
             else:
                 # 非 session 错误，记录并继续
                 result = LatencyResult(
@@ -1231,17 +1361,21 @@ class BenchmarkRunner:
                 return None  # 信号：重试
 
             if self._consecutive_audio_failures >= self.AUDIO_PIPE_MAX_CONSEC_FAIL:
-                if self._recover_audio_pipeline(bot):
+                # ── 管道恢复失败 → 全局完整重置 ──
+                logger.warning(
+                    f"[{target}] 🔧 音频管道连续失败 "
+                    f"{self._consecutive_audio_failures} 次，"
+                    f"执行全局完整重置..."
+                )
+                if bots and self._full_environment_reset(bots):
                     logger.info(
-                        f"[{target}] ♻️ 管道恢复后重试"
+                        f"[{target}] ♻️ 全局重置后重试"
                         f"第 {round_num+1} 轮"
                     )
-                    bot.reset_app()
-                    time.sleep(5)
                     return None  # 信号：重试
                 else:
                     logger.error(
-                        f"[{target}] ❌ 管道恢复失败，记录失败并继续"
+                        f"[{target}] ❌ 全局重置失败，记录失败并继续"
                     )
             return result  # 管道失败的结果
 
@@ -1320,7 +1454,7 @@ class BenchmarkRunner:
         # 初始化各 target 的 bot 和状态
         bots: Dict[str, object] = {}
         session_reconnect_counts: Dict[str, int] = {}
-        skip_targets = set()
+        full_reset_count = 0  # 全局重置计数
 
         for target in targets:
             self.results[target] = []
@@ -1336,7 +1470,8 @@ class BenchmarkRunner:
                     logger.info(f"✅ [{target}] Bot 已连接")
                 except Exception as e:
                     logger.error(f"❌ [{target}] Bot 连接失败: {e}")
-                    skip_targets.add(target)
+                    # 初始连接失败不跳过，后续全局重置可能恢复
+                    bots[target] = self._get_bot(target)
 
             # ── 交替测试主循环 ──
             for round_num in range(self.config.benchmark.num_rounds):
@@ -1347,9 +1482,6 @@ class BenchmarkRunner:
                 logger.info(f"{'#'*60}")
 
                 for target in targets:
-                    if target in skip_targets:
-                        continue
-
                     bot = bots[target]
                     self._consecutive_audio_failures = 0
 
@@ -1360,23 +1492,17 @@ class BenchmarkRunner:
                         )
 
                         _round_start_idx = len(self.results[target])
-                        max_retries = 3
+                        max_retries = self.FULL_RESET_MAX_ATTEMPTS + 3
                         for attempt in range(max_retries):
-                            try:
-                                result = self._run_target_round(
-                                    target, round_num, sub, bot,
-                                    session_reconnect_counts,
-                                )
-                            except Exception:
-                                # session/模拟器恢复彻底失败
-                                skip_targets.add(target)
-                                logger.error(
-                                    f"[{target}] ❌ 不可恢复错误，跳过此 target"
-                                )
-                                break
+                            result = self._run_target_round(
+                                target, round_num, sub, bot,
+                                session_reconnect_counts,
+                                bots=bots,
+                            )
 
                             if result is None:
-                                # 需要重试
+                                # 需要重试 — bot 可能已被全局重置更新
+                                bot = bots[target]
                                 continue
                             else:
                                 self.results[target].append(result)
@@ -1384,8 +1510,18 @@ class BenchmarkRunner:
                         else:
                             # max_retries 用完
                             logger.error(
-                                f"[{target}] ❌ 重试 {max_retries} 次仍失败"
+                                f"[{target}] ❌ 重试 {max_retries} 次仍失败，"
+                                f"记录空结果继续"
                             )
+                            self.results[target].append(LatencyResult(
+                                e2e_latency=0, ttfr=0,
+                                total_response_time=0,
+                                user_speech_start=0, user_speech_end=0,
+                                ai_speech_start=0, ai_speech_end=0,
+                                target=target, round_num=round_num,
+                                is_valid=False,
+                                error_msg="MAX_RETRIES_EXHAUSTED",
+                            ))
 
                         # ── 单轮实时上报 ──
                         if self._cloud_uploader:
@@ -1414,9 +1550,11 @@ class BenchmarkRunner:
                             time.sleep(self.config.benchmark.round_interval)
 
                     # target 间切换：重置当前 APP
-                    if target not in skip_targets:
+                    try:
                         bot.reset_app()
-                        time.sleep(self.config.benchmark.round_interval)
+                    except Exception:
+                        pass
+                    time.sleep(self.config.benchmark.round_interval)
 
                 # 大轮间等待
                 if round_num < self.config.benchmark.num_rounds - 1:
