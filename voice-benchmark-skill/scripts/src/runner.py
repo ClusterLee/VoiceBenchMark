@@ -180,6 +180,48 @@ class BenchmarkRunner:
         except Exception:
             return False
 
+    @classmethod
+    def _wait_for_adb_device(cls, timeout: float = 60.0) -> bool:
+        """等待 adb 设备完全就绪（emulator-5554 状态为 'device'）
+
+        模拟器 boot_completed=1 后，adb 设备可能仍未完全注册，
+        Appium 创建 session 需要 adb 设备处于 'device' 状态。
+
+        Args:
+            timeout: 最大等待时间（秒）
+
+        Returns:
+            True = 设备就绪, False = 超时
+        """
+        adb = cls._find_adb()
+        t_start = time.time()
+        poll_interval = 3.0
+
+        while time.time() - t_start < timeout:
+            try:
+                result = subprocess.run(
+                    [adb, "devices"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                # 查找 "emulator-5554\tdevice" 行（注意是 tab 分隔）
+                for line in result.stdout.strip().split("\n"):
+                    if "emulator-" in line and "\tdevice" in line:
+                        elapsed = time.time() - t_start
+                        logger.info(
+                            f"✅ [ADB] 设备已就绪: {line.strip()} "
+                            f"({elapsed:.0f}s)"
+                        )
+                        # 额外等待 5s 让 adb 连接完全稳定
+                        # （避免 Appium 创建 session 时 race condition）
+                        time.sleep(5)
+                        return True
+            except Exception:
+                pass
+            time.sleep(poll_interval)
+
+        logger.error(f"❌ [ADB] 设备等待超时 ({timeout}s)")
+        return False
+
     @staticmethod
     def _is_qemu_running() -> bool:
         """检查 qemu 进程是否存在（不依赖 adb，直接看进程表）
@@ -289,22 +331,53 @@ class BenchmarkRunner:
         except Exception:
             pass
 
-        # 2.5 关闭崩溃报告对话框（macOS 上的 "Android Emulator closed unexpectedly" 窗口）
-        try:
-            subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to '
-                 'if exists (process "qemu-system-aarch64") then '
-                 'tell process "qemu-system-aarch64" to '
-                 'click button "Don\'t send" of window 1 end tell end if'],
-                capture_output=True, timeout=5,
-            )
-        except Exception:
-            pass
+        # 2.5 关闭崩溃报告对话框（macOS 上的 "qemu-system-aarch64 意外退出" 窗口）
+        # 尝试多种方式关闭，支持中英文系统
+        for dismiss_script in [
+            # 中文系统："忽略" 按钮
+            'tell application "System Events" to try\n'
+            'set crashDialogs to every window of every process whose name contains "qemu"\n'
+            'repeat with dlg in crashDialogs\n'
+            'click button "忽略" of dlg\n'
+            'end repeat\n'
+            'end try',
+            # 英文系统："Ignore" 按钮
+            'tell application "System Events" to try\n'
+            'set crashDialogs to every window of every process whose name contains "qemu"\n'
+            'repeat with dlg in crashDialogs\n'
+            'click button "Ignore" of dlg\n'
+            'end repeat\n'
+            'end try',
+            # macOS 用户报告崩溃对话框 — 直接按 Escape 关闭
+            'tell application "System Events"\n'
+            'try\n'
+            'if exists (process "UserNotificationCenter") then\n'
+            'tell process "UserNotificationCenter"\n'
+            'keystroke (ASCII character 27)\n'
+            'end tell\n'
+            'end if\n'
+            'end try\n'
+            'end tell',
+        ]:
+            try:
+                subprocess.run(
+                    ["osascript", "-e", dismiss_script],
+                    capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
         # 也尝试直接关闭残留的崩溃报告窗口进程
         try:
             subprocess.run(
                 ["pkill", "-f", "CrashReporterSupport"],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+        # 杀掉可能残留的 Problem Reporter 进程
+        try:
+            subprocess.run(
+                ["pkill", "-f", "Problem Reporter"],
                 capture_output=True, timeout=5,
             )
         except Exception:
@@ -661,6 +734,9 @@ class BenchmarkRunner:
             )
 
         if all_ok:
+            # 确保 adb 设备完全就绪（boot_completed ≠ adb ready）
+            if not self._wait_for_adb_device(timeout=60):
+                logger.warning("⚠️ [Preflight] adb 设备等待超时，继续尝试...")
             logger.info("✅ [Preflight] 环境预检通过")
         else:
             logger.error("❌ [Preflight] 环境预检未通过，测试可能失败")
@@ -1204,6 +1280,11 @@ class BenchmarkRunner:
         # 4. preflight 重新拉起环境
         if not self.preflight_check():
             logger.error("❌ [FullReset] 环境预检失败")
+            return False
+
+        # 4.5 等待 adb 设备完全就绪（boot_completed ≠ adb ready）
+        if not self._wait_for_adb_device(timeout=60):
+            logger.error("❌ [FullReset] adb 设备等待超时")
             return False
 
         # 5. 重建 gRPC 连接
