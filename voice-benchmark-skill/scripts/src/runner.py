@@ -1280,23 +1280,23 @@ class BenchmarkRunner:
     FULL_RESET_MAX_ATTEMPTS = 3    # 全局重置最大尝试次数
 
     def _full_environment_reset(self, bots: Dict[str, object]) -> bool:
-        """全局完整环境重置（等同于之前 bash 循环的新批次效果）
+        """全局完整环境重置
 
-        执行步骤：
-        1. 断开所有 bot
-        2. 杀掉模拟器 + 清理残留（含 coreaudiod 重启）
-        3. 冷却等待 30s
-        4. preflight 重新拉起模拟器 + Appium
-        5. 重建 gRPC 连接
-        6. 重连所有 bot
+        v3 策略：不在进程内反复挣扎恢复。
+        失败时直接 sys.exit(1)，让外壳循环 (run_loop.sh) 接管：
+          外壳会杀掉所有残留 → 重启 coreaudiod → 冷却 → 全新 Python 进程
+
+        这就是之前 bash 外壳能跑 21h/214批/49次崩溃恢复的核心原因：
+        进程级隔离，不留任何僵死状态。
 
         Returns:
-            True = 恢复成功, False = 彻底失败
+            True = 恢复成功（进程内继续）
+            不会返回 False — 失败时直接 exit
         """
         logger.warning("🔄🔄🔄 [FullReset] 开始全局完整环境重置...")
 
         # 1. 断开所有 bot（忽略错误）
-        for target, bot in bots.items():
+        for target_name, bot in bots.items():
             try:
                 bot.disconnect()
             except Exception:
@@ -1314,13 +1314,19 @@ class BenchmarkRunner:
 
         # 4. preflight 重新拉起环境
         if not self.preflight_check():
-            logger.error("❌ [FullReset] 环境预检失败")
-            return False
+            logger.error(
+                "❌ [FullReset] 环境预检失败 → 退出进程，"
+                "交给外壳循环重新启动"
+            )
+            sys.exit(1)
 
-        # 4.5 等待 adb 设备完全就绪（boot_completed ≠ adb ready）
+        # 4.5 等待 adb 设备完全就绪
         if not self._wait_for_adb_device(timeout=60):
-            logger.error("❌ [FullReset] adb 设备等待超时")
-            return False
+            logger.error(
+                "❌ [FullReset] adb 设备等待超时 → 退出进程，"
+                "交给外壳循环重新启动"
+            )
+            sys.exit(1)
 
         # 5. 重建 gRPC 连接
         try:
@@ -1328,56 +1334,35 @@ class BenchmarkRunner:
             self._injector_connected = True
             logger.info("✅ [FullReset] gRPC 连接已重建")
         except Exception as e:
-            logger.error(f"❌ [FullReset] gRPC 重建失败: {e}")
-            self._injector_connected = False
+            logger.error(
+                f"❌ [FullReset] gRPC 重建失败: {e} → 退出进程，"
+                f"交给外壳循环重新启动"
+            )
+            sys.exit(1)
 
-        # 5.5 gRPC 重连可能耗时较长，再次验证 adb 设备就绪
-        #     （重连期间设备状态可能变化）
+        # 5.5 gRPC 重连后再次验证 adb
         if not self._wait_for_adb_device(timeout=60):
-            logger.error("❌ [FullReset] adb 设备在 gRPC 重连后变为不可用")
-            return False
+            logger.error(
+                "❌ [FullReset] adb 在 gRPC 重连后不可用 → 退出进程，"
+                "交给外壳循环重新启动"
+            )
+            sys.exit(1)
 
-        # 6. 重连所有 bot（带重试：设备刚就绪时 Appium 可能短暂找不到设备）
-        BOT_CONNECT_MAX_RETRIES = 3
-        BOT_CONNECT_RETRY_DELAY = 15  # 每次重试前等待秒数
-        all_ok = True
-        for target, bot in bots.items():
-            connected = False
-            for attempt in range(1, BOT_CONNECT_MAX_RETRIES + 1):
-                try:
-                    bot.connect()
-                    logger.info(f"✅ [FullReset] [{target}] Bot 已重连")
-                    connected = True
-                    break
-                except Exception as e:
-                    if attempt < BOT_CONNECT_MAX_RETRIES:
-                        logger.warning(
-                            f"⚠️ [FullReset] [{target}] Bot 重连失败 "
-                            f"(尝试 {attempt}/{BOT_CONNECT_MAX_RETRIES}): {e}"
-                        )
-                        logger.info(
-                            f"⏳ [FullReset] 等待 {BOT_CONNECT_RETRY_DELAY}s "
-                            f"后重试..."
-                        )
-                        time.sleep(BOT_CONNECT_RETRY_DELAY)
-                        # 重试前再验证 adb 设备
-                        self._wait_for_adb_device(timeout=30)
-                    else:
-                        logger.error(
-                            f"❌ [FullReset] [{target}] Bot 重连失败 "
-                            f"(已重试 {BOT_CONNECT_MAX_RETRIES} 次): {e}"
-                        )
-            if not connected:
-                all_ok = False
+        # 6. 重连所有 bot（只试一次，失败就退出让外壳接管）
+        for target_name, bot in bots.items():
+            try:
+                bot.connect()
+                logger.info(f"✅ [FullReset] [{target_name}] Bot 已重连")
+            except Exception as e:
+                logger.error(
+                    f"❌ [FullReset] [{target_name}] Bot 重连失败: {e} "
+                    f"→ 退出进程，交给外壳循环重新启动"
+                )
+                sys.exit(1)
 
-        if all_ok:
-            logger.info("✅✅✅ [FullReset] 全局环境重置完成！")
-        else:
-            logger.warning("⚠️ [FullReset] 部分 Bot 重连失败")
-
-        # 重置计数器
+        logger.info("✅✅✅ [FullReset] 全局环境重置完成！")
         self._consecutive_audio_failures = 0
-        return all_ok
+        return True
 
     def _run_target_round(
         self, target: str, round_num: int, sub_round: int,
@@ -1417,17 +1402,15 @@ class BenchmarkRunner:
                 logger.error(
                     f"[{target}] ❌ Bot 连接失败: {conn_e}，触发全局重置"
                 )
-                if bots and self._full_environment_reset(bots):
-                    return None  # 信号：重试
-                return LatencyResult(
-                    e2e_latency=0, ttfr=0,
-                    total_response_time=0,
-                    user_speech_start=0, user_speech_end=0,
-                    ai_speech_start=0, ai_speech_end=0,
-                    target=target, round_num=round_num,
-                    is_valid=False,
-                    error_msg=f"BOT_CONNECT_FAILED: {conn_e}",
+                # v3: full reset 失败时直接 exit，外壳循环接管
+                if bots:
+                    self._full_environment_reset(bots)
+                    return None  # 重置成功，重试
+                # 没有 bots dict，无法全局重置 → exit 让外壳接管
+                logger.error(
+                    f"[{target}] ❌ 无法恢复 → 退出进程"
                 )
+                sys.exit(1)
 
         # ── 预防性 gRPC 重建（每 N 轮）──
         if self._should_reconnect_grpc(global_round):
@@ -1470,26 +1453,18 @@ class BenchmarkRunner:
                     f"[{target}] 🔧 Session 轻量恢复失败，"
                     f"执行全局完整重置..."
                 )
-                if bots and self._full_environment_reset(bots):
+                # v3: full reset 失败时直接 exit，外壳循环接管
+                if bots:
+                    self._full_environment_reset(bots)
                     session_reconnect_counts[target] = 0
                     logger.info(
                         f"[{target}] ♻️ 全局重置后重试第 {round_num+1} 轮"
                     )
                     return None  # 信号：重试
-                else:
-                    # 全局重置也失败了，记录失败但不跳过 target
-                    logger.error(
-                        f"[{target}] ❌ 全局重置失败，记录失败继续下一轮"
-                    )
-                    return LatencyResult(
-                        e2e_latency=0, ttfr=0,
-                        total_response_time=0,
-                        user_speech_start=0, user_speech_end=0,
-                        ai_speech_start=0, ai_speech_end=0,
-                        target=target, round_num=round_num,
-                        is_valid=False,
-                        error_msg=f"FULL_RESET_FAILED: {err_msg[:100]}",
-                    )
+                logger.error(
+                    f"[{target}] ❌ 无法恢复 → 退出进程"
+                )
+                sys.exit(1)
             else:
                 # 非 session 错误，记录并继续
                 result = LatencyResult(
@@ -1537,16 +1512,18 @@ class BenchmarkRunner:
                     f"{self._consecutive_audio_failures} 次，"
                     f"执行全局完整重置..."
                 )
-                if bots and self._full_environment_reset(bots):
+                # v3: full reset 失败时直接 exit，外壳循环接管
+                if bots:
+                    self._full_environment_reset(bots)
                     logger.info(
                         f"[{target}] ♻️ 全局重置后重试"
                         f"第 {round_num+1} 轮"
                     )
                     return None  # 信号：重试
-                else:
-                    logger.error(
-                        f"[{target}] ❌ 全局重置失败，记录失败并继续"
-                    )
+                logger.error(
+                    f"[{target}] ❌ 无法恢复 → 退出进程"
+                )
+                sys.exit(1)
             return result  # 管道失败的结果
 
         # ── 成功或非管道失败 ──
