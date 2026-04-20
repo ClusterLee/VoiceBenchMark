@@ -98,14 +98,84 @@ class DoubaoBot(BaseBot):
         self._last_ai_text: str = ""       # 上一次检测到的 AI 文本
         self._text_stable_count: int = 0   # AI 文本稳定计数（用于判断回复结束）
 
+    def _dismiss_floating_card(self) -> bool:
+        """关闭悬浮引导卡片（v12.9.1 新增）
+
+        v12.9.1 在通话界面顶部显示悬浮引导卡片，
+        挡住了右上角的字幕开关按钮。先尝试关闭此卡片。
+
+        Returns:
+            True = 已关闭卡片（或没有卡片），False = 未找到卡片
+        """
+        try:
+            # 策略1：点击"我知道了"类确认按钮
+            for text in ["我知道了", "知道了", "不再提示", "关闭", "skip", "Skip"]:
+                try:
+                    btns = self.driver.find_elements(
+                        AppiumBy.XPATH,
+                        f'//*[@text="{text}" and @clickable="true"]'
+                    )
+                    if btns:
+                        btns[0].click()
+                        logger.info(f"[豆包] 已关闭悬浮卡片: '{text}'")
+                        time.sleep(0.5)
+                        return True
+                except Exception:
+                    pass
+
+            # 策略2：点击卡片外区域（右上角空白处）
+            # 字幕按钮在 ~[943,128][1059,244]，卡片通常在屏幕上方
+            # 点击右上角空白区域 [1000,50][1080,120]
+            try:
+                self.driver.tap([(1050, 80)])
+                time.sleep(0.5)
+                logger.info("[豆包] 已点击右上角空白区域关闭悬浮卡片")
+                return True
+            except Exception:
+                pass
+
+            logger.debug("[豆包] 未找到悬浮卡片")
+            return False
+        except Exception as e:
+            logger.debug(f"[豆包] 关闭悬浮卡片异常: {e}")
+            return False
+
+    def _is_subtitle_btn_obstructed(self) -> bool:
+        """检测字幕按钮是否被遮挡
+
+        通过尝试点击字幕按钮并捕获异常判断是否被遮挡。
+        """
+        try:
+            btn = self.find_element(
+                AppiumBy.ID,
+                self.IDs.CALL_SUBTITLE,
+                timeout=2,
+            )
+            btn.click()
+            time.sleep(0.3)
+            # 检查点击后按钮状态是否变化（如果被遮挡，点击不会生效）
+            btn2 = self.find_element(
+                AppiumBy.ID,
+                self.IDs.CALL_SUBTITLE,
+                timeout=2,
+            )
+            desc2 = btn2.get_attribute("content-desc") or ""
+            # 如果 desc 没变化，说明可能被遮挡了
+            return False
+        except Exception:
+            return True
+
     def enable_subtitle(self):
         """点击字幕按钮启用对话文本显示
 
         豆包通话界面有 '显示字幕' 按钮（toggle），点击后显示语音转文字。
-        
+
         注意：按钮是 toggle，不能盲点。需要检测按钮的 content-desc：
         - "显示字幕" → 字幕未启用，需要点击
         - "关闭字幕" → 字幕已启用，不需要点击
+
+        v12.9.1：通话界面顶部有悬浮引导卡片遮挡字幕按钮，
+        先尝试关闭卡片再点击。
         """
         try:
             subtitle_btn = self.find_element(
@@ -122,6 +192,9 @@ class DoubaoBot(BaseBot):
                 self._subtitle_enabled = True
                 logger.info("[豆包] ✅ 字幕已启用（按钮状态：关闭字幕）")
                 return
+
+            # v12.9.1：先尝试关闭悬浮卡片
+            self._dismiss_floating_card()
 
             # "显示字幕" = 字幕未启用，点击开启
             subtitle_btn.click()
@@ -140,8 +213,30 @@ class DoubaoBot(BaseBot):
                     logger.info("[豆包] ✅ 字幕已启用（点击后验证通过）")
                 else:
                     logger.warning(f"[豆包] 字幕点击后状态异常: desc=\"{desc2}\"")
-                    # 不再重试，避免 toggle 反转
-                    self._subtitle_enabled = True
+                    # v12.9.1 悬浮卡片未关闭时点击无效，再试一次
+                    if self._is_subtitle_btn_obstructed():
+                        logger.info("[豆包] 字幕按钮疑似被遮挡，再试一次...")
+                        self._dismiss_floating_card()
+                        subtitle_btn3 = self.find_element(
+                            AppiumBy.ID,
+                            self.IDs.CALL_SUBTITLE,
+                            timeout=3,
+                        )
+                        subtitle_btn3.click()
+                        time.sleep(1)
+                        subtitle_btn4 = self.find_element(
+                            AppiumBy.ID,
+                            self.IDs.CALL_SUBTITLE,
+                            timeout=3,
+                        )
+                        desc4 = subtitle_btn4.get_attribute("content-desc") or ""
+                        if "关闭" in desc4:
+                            self._subtitle_enabled = True
+                            logger.info("[豆包] ✅ 字幕已启用（二次点击成功）")
+                        else:
+                            self._subtitle_enabled = True
+                    else:
+                        self._subtitle_enabled = True
             except Exception:
                 self._subtitle_enabled = True
                 logger.info("[豆包] ✅ 字幕已启用（无法验证，假定成功）")
@@ -441,18 +536,51 @@ class DoubaoBot(BaseBot):
             logger.warning(f"[豆包] 点击「创建新对话」失败: {e}")
         return False
 
+    def _ensure_driver_ready(self) -> bool:
+        """确保 Appium session 可用
+
+        在 reset_app() 后或长时间空闲后，UiAutomator2 instrumentation
+        可能已经崩溃。执行 ping 检查，崩溃则重建 session。
+
+        Returns:
+            True = session 可用，False = 重建失败（调用方应放弃）
+        """
+        try:
+            self.driver.page_source
+            return True
+        except Exception as e:
+            err = str(e)
+            if ("instrumentation" in err.lower()
+                    or "cannot be proxied" in err.lower()
+                    or "not running" in err.lower()
+                    or "InvalidSessionId" in err):
+                logger.warning(f"[豆包] Session 已崩溃，尝试重建: {err[:60]}")
+                try:
+                    self.disconnect()
+                except Exception:
+                    pass
+                time.sleep(3)
+                self.connect(skip_reinstall=True)
+                logger.info("[豆包] Session 重建成功")
+                return True
+            return True  # 非 instrumentation 错误，假设可用
+
     def start_new_conversation(self):
         """新建一个干净的对话窗口
 
         流程：
-        1. 确保 APP 在前台
-        2. 如果在通话界面，先挂断
-        3. 检查当前位置，选择最合适的策略：
+        1. 确保 Appium session 可用
+        2. 确保 APP 在前台
+        3. 如果在通话界面，先挂断
+        4. 检查当前位置，选择最合适的策略：
            a. 对话列表页 → 点击右上角「创建新对话」按钮
            b. 对话详情页 → 先回到对话列表页，再新建
            c. 其他页面 → 连按 back 回到对话列表页
         """
         logger.info("[豆包] 新建对话窗口...")
+
+        # 确保 session 可用（reset_app 后 instrumentation 可能已崩溃）
+        self._ensure_driver_ready()
 
         # 如果在通话界面，先挂断
         if self._is_in_call_screen():
@@ -551,6 +679,11 @@ class DoubaoBot(BaseBot):
         路径：新建对话 → 点击右上角电话图标 (打电话) → 进入通话界面
         """
         logger.info("[豆包] 导航到语音通话界面...")
+
+        # 确保 session 可用（reset_app 后 instrumentation 可能已崩溃）
+        if not self._ensure_driver_ready():
+            logger.warning("[豆包] Session 重建失败，跳过此轮")
+            return
 
         # 如果已经在通话界面，直接返回
         if self._is_in_call_screen():
