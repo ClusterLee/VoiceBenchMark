@@ -1,0 +1,24 @@
+# Pixel_6_API_34 AVD config.ini 关键项模板
+# 由 setup_mac.sh apply_avd_config() 合并写入 ~/.android/avd/Pixel_6_API_34.avd/config.ini
+# ⚠️ 这些 key 缺一不可，否则跑几小时必崩
+#
+# 校准基线 (2026-04-03):
+#   - hw.gpu.mode=host: 使用 Apple M 系列 Metal 硬件 GPU。lavapipe/auto 会软件渲染 hang/crash
+#   - hw.audioInput=yes: 启用虚拟麦克风。否则 gRPC injectAudio 失败
+#   - disk.dataPartition.size=8192M: 默认 800M 装不下豆包+元宝（豆包就 538MB）
+#   - hw.ramSize=4096: 默认 2048 容易 OOM
+#   - hw.keyboard=yes: 让 Appium sendKeys 直接走 IME，比模拟点击快
+#   - showDeviceFrame=no: 模拟器框架占屏幕，省一点 GPU 资源
+
+hw.gpu.mode=host
+hw.gpu.enabled=yes
+hw.audioInput=yes
+hw.audioOutput=yes
+hw.ramSize=4096
+hw.keyboard=yes
+hw.cpu.ncore=4
+disk.dataPartition.size=8192M
+showDeviceFrame=no
+runtime.network.speed=full
+runtime.network.latency=none
+PlayStore.enabled=no

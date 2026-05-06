@@ -460,6 +460,10 @@ class YuanbaoBot(BaseBot):
         """
         logger.info("[元宝] 导航到语音通话界面...")
 
+        # 入口先确保 session 可用（UiAutomator2 instrumentation 崩溃则自动重建）
+        if not self._ensure_driver_ready():
+            raise RuntimeError("[元宝] Appium session 不可用，无法导航")
+
         # 处理可能存在的通话断开弹窗
         self._handle_disconnect_dialog()
 

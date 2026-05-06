@@ -536,34 +536,7 @@ class DoubaoBot(BaseBot):
             logger.warning(f"[豆包] 点击「创建新对话」失败: {e}")
         return False
 
-    def _ensure_driver_ready(self) -> bool:
-        """确保 Appium session 可用
-
-        在 reset_app() 后或长时间空闲后，UiAutomator2 instrumentation
-        可能已经崩溃。执行 ping 检查，崩溃则重建 session。
-
-        Returns:
-            True = session 可用，False = 重建失败（调用方应放弃）
-        """
-        try:
-            self.driver.page_source
-            return True
-        except Exception as e:
-            err = str(e)
-            if ("instrumentation" in err.lower()
-                    or "cannot be proxied" in err.lower()
-                    or "not running" in err.lower()
-                    or "InvalidSessionId" in err):
-                logger.warning(f"[豆包] Session 已崩溃，尝试重建: {err[:60]}")
-                try:
-                    self.disconnect()
-                except Exception:
-                    pass
-                time.sleep(3)
-                self.connect(skip_reinstall=True)
-                logger.info("[豆包] Session 重建成功")
-                return True
-            return True  # 非 instrumentation 错误，假设可用
+    # _ensure_driver_ready 已上移到 BaseBot，豆包/元宝共用
 
     def start_new_conversation(self):
         """新建一个干净的对话窗口

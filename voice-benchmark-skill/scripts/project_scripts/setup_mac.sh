@@ -25,6 +25,55 @@ check_installed() {
     fi
 }
 
+# ---- 版本锁定（pinned versions, 2026-04-03 校准基线）----
+# 用法: require_version <cmd> <min-version> <version-extract-cmd>
+# 失败立即 exit 1，避免装错版本但 setup 继续往下跑
+require_version() {
+    local cmd=$1 min=$2 extract=$3 actual
+    if ! command -v "$cmd" &>/dev/null; then
+        echo -e "${RED}✗${NC} $cmd 未安装"; return 1
+    fi
+    actual=$(eval "$extract" 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    if [ -z "$actual" ]; then
+        echo -e "${YELLOW}⚠${NC} $cmd 版本无法解析，跳过校验"; return 0
+    fi
+    if printf '%s\n%s\n' "$min" "$actual" | sort -V -C 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} $cmd $actual (>= $min)"
+        return 0
+    else
+        echo -e "${RED}✗${NC} $cmd $actual 低于要求 $min"
+        return 1
+    fi
+}
+
+# 架构硬性检查（仅支持 arm64，因为 AVD 镜像是 arm64-v8a）
+check_arch() {
+    local arch=$(uname -m)
+    if [ "$arch" != "arm64" ]; then
+        echo -e "${RED}✗${NC} 当前架构 $arch，本 skill 仅支持 Apple Silicon (arm64)"
+        echo "   AVD 系统镜像是 arm64-v8a，x86_64 Mac 需另选 x86 镜像（未测试）"
+        exit 1
+    fi
+    echo -e "${GREEN}✓${NC} 架构: arm64 (Apple Silicon)"
+}
+
+# 磁盘空间检查（AVD + 镜像 + APK 至少需 25GB）
+check_disk_space() {
+    local need_gb=25 free_gb
+    free_gb=$(df -g "$HOME" | awk 'NR==2 {print $4}')
+    if [ "$free_gb" -lt "$need_gb" ]; then
+        echo -e "${RED}✗${NC} 剩余磁盘空间 ${free_gb}GB，至少需要 ${need_gb}GB"
+        exit 1
+    fi
+    echo -e "${GREEN}✓${NC} 磁盘空间: ${free_gb}GB 可用"
+}
+
+# ---- 0. 架构 + 磁盘空间硬性检查 ----
+echo ""
+echo "🔍 0/8 系统硬性检查..."
+check_arch
+check_disk_space
+
 # ---- 1. Homebrew ----
 echo ""
 echo "📦 1/8 检查 Homebrew..."
@@ -42,7 +91,7 @@ if ! check_installed java; then
     echo 'export PATH="/opt/homebrew/opt/openjdk@17/bin:$PATH"' >> ~/.zshrc
     export PATH="/opt/homebrew/opt/openjdk@17/bin:$PATH"
 fi
-java -version 2>&1 | head -1
+require_version java 17.0 'java -version' || { echo "请安装 JDK 17+: brew install openjdk@17"; exit 1; }
 
 # ---- 3. Android SDK (via cmdline-tools) ----
 echo ""
@@ -82,6 +131,43 @@ if ! avdmanager list avd 2>/dev/null | grep -q "Pixel_6_API_34"; then
         --force
 fi
 
+# ---- AVD config.ini 关键项合并（防 GPU/音频/磁盘默认值踩坑）----
+apply_avd_config() {
+    local avd_dir="$HOME/.android/avd/Pixel_6_API_34.avd"
+    local config="$avd_dir/config.ini"
+    local template
+    template="$(cd "$(dirname "$0")" && pwd)/../configs/avd_config.ini.template"
+
+    if [ ! -f "$config" ]; then
+        echo -e "${YELLOW}⚠${NC} AVD config.ini 不存在: $config"
+        return 1
+    fi
+    if [ ! -f "$template" ]; then
+        echo -e "${YELLOW}⚠${NC} avd_config 模板不存在: $template"
+        return 1
+    fi
+
+    # 备份
+    cp "$config" "${config}.bak.$(date +%s)"
+
+    # 逐行合并：模板里的 key 覆盖 config.ini 的同名 key
+    while IFS='=' read -r key val; do
+        [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+        key=$(echo "$key" | xargs)
+        val=$(echo "$val" | xargs)
+        if grep -q "^${key}=" "$config"; then
+            # 用 perl 替代 sed -i（macOS sed -i 语法蛋疼）
+            perl -i -pe "s|^${key}=.*|${key}=${val}|" "$config"
+        else
+            echo "${key}=${val}" >> "$config"
+        fi
+    done < "$template"
+
+    echo -e "${GREEN}✓${NC} AVD config.ini 已应用模板（备份: ${config}.bak.*）"
+    grep -E "^(hw.gpu.mode|hw.audioInput|disk.dataPartition.size|hw.ramSize)=" "$config"
+}
+apply_avd_config
+
 check_installed adb
 
 # ---- 4. BlackHole 2ch 虚拟音频驱动 ----
@@ -120,7 +206,7 @@ if ! check_installed node; then
     echo "安装 Node.js..."
     brew install node@20
 fi
-echo "Node.js: $(node --version)"
+require_version node 20.0 'node --version' || { echo "请升级 Node: brew install node@20"; exit 1; }
 
 # ---- 7. Appium ----
 echo ""
@@ -130,11 +216,18 @@ if ! check_installed appium; then
     npm install -g appium
     appium driver install uiautomator2
 fi
-echo "Appium: $(appium --version 2>/dev/null || echo 'installed')"
+require_version appium 2.5 'appium --version' || { echo "Appium 必须 >=2.5; npm install -g appium@latest"; exit 1; }
+# UiAutomator2 driver 必须存在
+if ! appium driver list --installed 2>&1 | grep -q uiautomator2; then
+    echo -e "${YELLOW}⚠${NC} 未检测到 uiautomator2 driver，安装中..."
+    appium driver install uiautomator2
+fi
+echo -e "${GREEN}✓${NC} uiautomator2 driver 已安装"
 
 # ---- 8. Python 依赖 ----
 echo ""
 echo "🐍 8/8 安装 Python 依赖..."
+require_version python3 3.9 'python3 --version' || { echo "请升级 Python: brew install python@3.11"; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 

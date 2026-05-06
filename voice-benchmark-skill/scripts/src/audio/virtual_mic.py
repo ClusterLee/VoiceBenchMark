@@ -192,7 +192,11 @@ class EmulatorMicInjector:
             self.stub.injectAudio(_gen(), timeout=10)
             logger.debug(f"[MicInjector] 静音预热完成 ({duration_ms}ms)")
         except grpc.RpcError as e:
-            logger.warning(f"[MicInjector] 预热失败: {e}")
+            # 不要吞异常：gRPC 失败意味着模拟器崩溃或 channel 已断开，
+            # 调用方（runner._full_environment_reset）必须感知到这点，
+            # 否则会误判"gRPC 连接已重建"而继续跑，最终 abort。
+            logger.error(f"[MicInjector] ❌ 预热失败: {e}")
+            raise
 
     def inject_wav(self, wav_path: str, timeout: float = 30.0) -> float:
         """

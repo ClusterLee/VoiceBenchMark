@@ -1,0 +1,39 @@
+# APK 固化清单
+# install_apks.sh 会按此清单校验 sha256 / version_code 后 adb install
+#
+# ⚠️ 添加新版本时必须填 sha256 和 version_code，否则会装错版本但 setup 看起来"成功"
+#
+# 当前已知正常版本 (2026-04-20 校准):
+#   - 豆包 12.9.1 / versionCode 12090101 (单文件 APK, 来自 APKPure)
+#   - 元宝 split APK (来自豌豆荚单文件版, APKPure 的会报 INSTALL_FAILED_MISSING_SPLIT)
+
+apps:
+  doubao:
+    package: com.larus.nova
+    version_name: "12.9.1"
+    version_code: 12090101
+    install_type: single        # adb install
+    apk_files:
+      - doubao.apk
+    sha256:
+      doubao.apk: ""            # TODO: 填入实际 sha256（shasum -a 256 doubao.apk）
+    download_hints:
+      - "APKPure 搜索「豆包」选 12.9.1 单文件 APK"
+      - "或从已登录手机用 adb pull /data/app/.../base.apk 拷出"
+
+  yuanbao:
+    package: com.tencent.hunyuan.app.chat
+    version_name: ""             # TODO: 填入实际版本
+    version_code: 0
+    install_type: split          # adb install-multiple
+    apk_files:
+      - yuanbao_base.apk
+      # split APK 通常还有 split_config.arm64_v8a.apk / split_config.zh.apk 等
+    sha256:
+      yuanbao_base.apk: ""
+    download_hints:
+      - "APKPure 元宝 split APK 会报 INSTALL_FAILED_MISSING_SPLIT"
+      - "改用豌豆荚下载单文件 APK，或扒已登录手机的整套 split"
+
+# APK 必须放在 assets/apk/ 目录
+apk_dir: assets/apk

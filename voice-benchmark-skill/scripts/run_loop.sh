@@ -10,15 +10,19 @@
 #   - runner.py 内部 _full_environment_reset() 仍然作为第一道防线
 #
 # Usage:
-#   ./run_loop.sh                # 默认：总共 1000 轮，每批次 5 轮
+#   ./run_loop.sh                # 默认：总共 100 轮，每批次 5 轮，每轮每 target 2 次
 #   ./run_loop.sh 500            # 总共 500 轮
 #   ./run_loop.sh 1000 10        # 总共 1000 轮，每批次 10 轮
 #   ./run_loop.sh 1000 5 2       # 总共 1000 轮，每批次 5 轮，每轮每 target 2 次
+#
+# 默认参数说明（2026-05-06 调整）：
+#   100 轮 × 2 target × 2 次 = 400 次测试，约 1.5h 完成
+#   过去用过 1000 轮（21h、214 批），过长不利于快速迭代验证
 
 set -o pipefail
 
 # ── 参数 ──
-TOTAL_ROUNDS="${1:-1000}"
+TOTAL_ROUNDS="${1:-100}"
 BATCH_SIZE="${2:-5}"
 REPEAT="${3:-2}"
 COOLDOWN=30  # 每批次间冷却秒数
@@ -87,6 +91,19 @@ log "   总测试数: $((TOTAL_ROUNDS * 2 * REPEAT))"
 log "   冷却时间: ${COOLDOWN}s"
 log "   主日志: $MASTER_LOG"
 log "============================================================"
+
+# ── 启动前预清理（2026-05-06 加固）──
+# 假说：5-6 上午小批次（2×2×2）频繁第 3 次注音崩，是因为 emulator/coreaudiod
+# 处于"未清洁"状态。run_loop 之前已有 kill_all/restart_coreaudiod 函数，
+# 但只在批次失败后调用，第一批次启动前没保护。
+# 16:12 那次 100 轮跑得稳，是因为 ANDROID_HOME 失误意外触发了一次 FullReset
+# 替我们做了清理。这里把这次"幸运清理"固化为"必然清理"。
+log ""
+log "🔧 [Pre-launch] 执行启动前全量清理..."
+kill_all
+restart_coreaudiod
+log "✅ [Pre-launch] 预清理完成，开始批次循环"
+log ""
 
 while [ "$completed" -lt "$TOTAL_ROUNDS" ]; do
     batch_num=$((batch_num + 1))

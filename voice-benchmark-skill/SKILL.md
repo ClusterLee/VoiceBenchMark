@@ -46,6 +46,93 @@ scripts/
 
 ## 🚀 首次安装 & 部署
 
+### 0. 前置依赖（新机器首次安装必读）
+
+> 这一节处理的是"裸机 → 可以开始跑 step 1"的所有硬门槛。跳过会在 `setup_mac.sh` 或 `doctor.sh` 处失败。
+
+#### 0.1 系统要求
+
+- macOS（Apple Silicon 或 Intel 皆可；arm64 优先，性能更稳）
+- 磁盘 ≥ 20GB 空闲（Android SDK + system-image + emulator data + APK ≈ 15GB）
+- **必须有音频输入设备**：Mac mini / Studio 没有内置麦克风 → 必须装 BlackHole 2ch，否则 gRPC `injectAudio` 注入的音频不会被 AVD 麦克风通道接收。
+
+```bash
+# 装 BlackHole 2ch
+brew install blackhole-2ch
+sudo killall coreaudiod   # 重启 CoreAudio 让虚拟设备生效
+```
+
+#### 0.2 工具链版本（硬门槛，setup_mac.sh 会校验）
+
+| 工具 | 最低版本 | 推荐 | 备注 |
+|------|----------|------|------|
+| Java JDK | 17 | 17 | Appium 自带 JRE，系统级 JDK 可选（soft check） |
+| Node.js | 20 | 22 | Appium 必须 |
+| Python | 3.9 | 3.9 / 3.13 | 跑 runner.py |
+| Appium | 2.5 | 3.2 | 必须 |
+| UiAutomator2 driver | 3.x | 7.x | Appium 插件 |
+| Android SDK platform-tools | 35.0.2 | 37.x | adb；`adb --version` 第 2 行是 build 版 |
+| Android Emulator | 34+ | 36.6.2 | 模拟器本体 |
+
+Node / Python 若用 workbuddy 内置托管版，路径见 memory：
+- Node 22: `/Users/licong/.workbuddy/binaries/node/versions/22.12.0/bin`
+- Python 3.9 venv: `/Users/licong/.workbuddy/binaries/python/envs/default/bin/python`
+
+#### 0.3 Android SDK 组件
+
+```bash
+# 1) 装 cmdline-tools（Android Studio 或手动解压到 ~/Library/Android/sdk/cmdline-tools/latest）
+# 2) 接受所有 licenses（不然 sdkmanager 安装一切都会卡）
+yes | ~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses
+
+# 3) 装必备组件
+~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager \
+  "platform-tools" \
+  "emulator" \
+  "system-images;android-34;google_apis;arm64-v8a"
+
+# 4) 环境变量（~/.zshrc）
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+```
+
+> ⚠️ **Appium 启动必须带这两个环境变量**，否则 `Neither ANDROID_HOME nor ANDROID_SDK_ROOT environment variable was exported` 会让所有 driver 创建失败：
+> ```bash
+> nohup env ANDROID_HOME=$HOME/Library/Android/sdk ANDROID_SDK_ROOT=$HOME/Library/Android/sdk \
+>   appium --port 4723 > /tmp/appium.log 2>&1 &
+> ```
+
+#### 0.4 Appium 安装
+
+```bash
+npm install -g appium@3.2
+appium driver install uiautomator2
+
+# 验证
+appium --version                  # ≥ 2.5
+appium driver list --installed    # 应看到 uiautomator2
+```
+
+#### 0.5 关键 APK 版本（固定，别乱升级）
+
+| APP | 包名 | 锁定版本 | versionCode | 获取渠道 |
+|-----|------|----------|-------------|----------|
+| 豆包 | `com.larus.nova` | **12.9.1** | 12090101 | APKPure 标准 APK |
+| 元宝 | `com.tencent.hunyuan.app.chat` | 最新 | — | **必须豌豆荚单文件版** |
+
+校验信息（sha256 + versionCode）已记录在 `scripts/configs/apk_manifest.yaml`，`install_apks.sh all` 会自动核对。
+
+**两个常见陷阱**：
+- ⚠️ **豆包版本别乱动**：v12.9.1 的 UI selector 已适配；升级到 13.x 或降到 ≤ 12.5 都可能让 `_dismiss_floating_card()` / voice call 按钮 selector 失效。
+- ⚠️ **元宝不能用 APKPure**：APKPure 给的是 split APK（base + config.arm64 + config.xxhdpi…），`adb install base.apk` 会报 `INSTALL_FAILED_MISSING_SPLIT`。用豌豆荚下载单文件版本，或 `adb install-multiple *.apk` 一起装。
+
+#### 0.6 wipe-data 陷阱
+
+模拟器 `-wipe-data` 会清空 data partition，**APP 会全部消失**。如果做过 FullReset / wipe-data，回到本章第 5 步重装 APK。
+
+---
+
 ### 1. 创建工作目录 & 复制源码
 
 ```bash
@@ -90,16 +177,28 @@ APK 文件过大（~538MB），不含在 skill 中。从以下渠道获取并放
   -n Pixel_6_API_34 -k "system-images;android-34;google_apis;arm64-v8a" \
   -d "pixel_6"
 
-# macOS 环境配置（一键脚本）
+# macOS 环境配置（一键脚本，含版本锁定 + AVD config 模板合并）
 bash "$WORK_DIR/scripts/setup_mac.sh"
 ```
 
 ### 5. 安装 APP 到模拟器
 
 ```bash
+# 推荐：用 manifest 校验 sha256 + versionCode
+bash scripts/install_apks.sh all
+
+# 或手动（需自己保证版本）
 adb install assets/apk/doubao.apk
-adb install assets/apk/yuanbao.apk
+adb install-multiple assets/apk/yuanbao_*.apk
 # 首次需手动登录
+```
+
+### 6. 体检（强烈建议）
+
+```bash
+bash scripts/doctor.sh
+# 退出码 0=全绿 / 1=有红
+# 10 项检查：架构 / 工具链版本 / 环境变量 / AVD config / BlackHole / 模拟器 / APK / Appium / gRPC / 音频
 ```
 
 ## 快速运行
@@ -127,12 +226,12 @@ cd scripts/
 nohup ./run_loop.sh <N> 5 2 > results/loop_<N>x2_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
-- **N 默认 1000**（用户只说"开始测试"时）
+- **N 默认 100**（用户只说"开始测试"时；2026-05-06 调整：从 1000 调到 100，约 1.5h 完成，方便快速迭代验证）
 - 每批次 5 轮，每轮元宝×2 + 豆包×2，总测试数 = N × 4
 - 批次之间自动清理进程 + 重启 coreaudiod + 冷却 30s
 
 例如：
-- "开始测试" → `./run_loop.sh 1000 5 2`（共 4000 次）
+- "开始测试" → `./run_loop.sh 100 5 2`（共 400 次）
 - "开始测试 1000 次" → `./run_loop.sh 1000 5 2`（共 4000 次）
 - "开始测试 100 次" → `./run_loop.sh 100 5 2`（共 400 次）
 

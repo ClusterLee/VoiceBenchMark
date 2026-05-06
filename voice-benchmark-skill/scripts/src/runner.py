@@ -155,14 +155,28 @@ class BenchmarkRunner:
 
     @classmethod
     def _is_emulator_running(cls) -> bool:
-        """检查 Android 模拟器是否在运行"""
+        """检查 Android 模拟器是否在运行且处于 'device' 状态
+
+        严格判定：必须匹配 `emulator-XXXX\tdevice` 这一精确行，
+        offline/unauthorized/no-device 等状态都不算 running。
+        """
         adb = cls._find_adb()
         try:
             result = subprocess.run(
                 [adb, "devices"],
                 capture_output=True, text=True, timeout=5,
             )
-            return "emulator-" in result.stdout
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line or line.startswith("List of devices"):
+                    continue
+                # 格式: "emulator-5554\tdevice"（tab 分隔）
+                parts = line.split()
+                if (len(parts) >= 2
+                        and parts[0].startswith("emulator-")
+                        and parts[1] == "device"):
+                    return True
+            return False
         except Exception:
             return False
 
@@ -620,11 +634,18 @@ class BenchmarkRunner:
             return False
 
         # 等待 boot_completed
+        # Android 14 冷启动通常需 45-90s，而 boot_completed=1 有可能被
+        # userdata 缓存"骗"得过早返回（尤其是 -no-snapshot-load 时）。
+        # 强制最少等 30s 再开始 poll，避免假阳性 ready。
+        MIN_BOOT_WAIT = 30
+        logger.info(f"⏳ [Preflight] 最少等待 {MIN_BOOT_WAIT}s 再开始检测 boot...")
+        time.sleep(MIN_BOOT_WAIT)
+
         t_start = time.time()
         poll_interval = 5.0
         while time.time() - t_start < timeout:
             if cls._is_emulator_running() and cls._is_emulator_booted():
-                elapsed = time.time() - t_start
+                elapsed = time.time() - t_start + MIN_BOOT_WAIT
                 logger.info(
                     f"✅ [Preflight] 模拟器已启动 ({elapsed:.0f}s)"
                 )
@@ -770,7 +791,8 @@ class BenchmarkRunner:
 
         if all_ok:
             # 确保 adb 设备完全就绪（boot_completed ≠ adb ready）
-            if not self._wait_for_adb_device(timeout=60):
+            # FullReset 后 API 34 冷启动通常 60-90s，给足 120s 余量
+            if not self._wait_for_adb_device(timeout=120):
                 logger.warning("⚠️ [Preflight] adb 设备等待超时，继续尝试...")
             logger.info("✅ [Preflight] 环境预检通过")
         else:
@@ -1321,27 +1343,31 @@ class BenchmarkRunner:
             sys.exit(1)
 
         # 4.5 等待 adb 设备完全就绪
-        if not self._wait_for_adb_device(timeout=60):
+        if not self._wait_for_adb_device(timeout=120):
             logger.error(
                 "❌ [FullReset] adb 设备等待超时 → 退出进程，"
                 "交给外壳循环重新启动"
             )
             sys.exit(1)
 
-        # 5. 重建 gRPC 连接
+        # 5. 重建 gRPC 连接 + warmup 探活
         try:
             self.injector.reconnect()
             self._injector_connected = True
-            logger.info("✅ [FullReset] gRPC 连接已重建")
+            # reconnect() 只建 channel；qemu 崩溃恢复后 channel 可能
+            # 能 3-way 握手但实际 injectAudio 会 RST。做一次 warmup 才能
+            # 确认管道真的通。
+            self.injector.inject_warmup(duration_ms=300)
+            logger.info("✅ [FullReset] gRPC 连接已重建并 warmup 通过")
         except Exception as e:
             logger.error(
-                f"❌ [FullReset] gRPC 重建失败: {e} → 退出进程，"
+                f"❌ [FullReset] gRPC 重建/warmup 失败: {e} → 退出进程，"
                 f"交给外壳循环重新启动"
             )
             sys.exit(1)
 
         # 5.5 gRPC 重连后再次验证 adb
-        if not self._wait_for_adb_device(timeout=60):
+        if not self._wait_for_adb_device(timeout=120):
             logger.error(
                 "❌ [FullReset] adb 在 gRPC 重连后不可用 → 退出进程，"
                 "交给外壳循环重新启动"

@@ -184,6 +184,46 @@ class BaseBot(ABC):
                 self._is_connected = False
                 self.driver = None
 
+    def _ensure_driver_ready(self) -> bool:
+        """检测并修复 Appium session
+
+        当 UiAutomator2 instrumentation 崩溃时，session 本身还存在，
+        但所有命令都会报 "cannot be proxied / instrumentation not running"。
+        用 page_source 做轻量 ping，出现崩溃特征时自动重建 session。
+
+        Returns:
+            True = session 可用（或已重建）；False = 无法恢复
+        """
+        try:
+            # 轻量 ping；page_source 会强制与 instrumentation 通信
+            _ = self.driver.page_source
+            return True
+        except Exception as e:
+            err = str(e)
+            crashed = (
+                "instrumentation" in err.lower()
+                or "cannot be proxied" in err.lower()
+                or "not running" in err.lower()
+                or "InvalidSessionId" in err
+                or "invalid session id" in err.lower()
+            )
+            if crashed:
+                logger.warning(f"[守护] Session 已崩溃，重建中: {err[:80]}")
+                try:
+                    self.disconnect()
+                except Exception:
+                    pass
+                time.sleep(3)
+                try:
+                    self.connect(skip_reinstall=True)
+                    logger.info("[守护] Session 重建成功")
+                    return True
+                except Exception as re:
+                    logger.error(f"[守护] Session 重建失败: {re}")
+                    return False
+            # 其他类型的异常不处理，交由上层 retry
+            return True
+
     def find_element(self, by: str, value: str, timeout: float = 10):
         """查找元素"""
         wait = WebDriverWait(self.driver, timeout)
