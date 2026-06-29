@@ -198,6 +198,69 @@ class EmulatorMicInjector:
             logger.error(f"[MicInjector] ❌ 预热失败: {e}")
             raise
 
+    def wait_audio_service_ready(
+        self,
+        settle_sec: float = 50.0,
+        confirm: bool = True,
+    ) -> bool:
+        """等待一段静默期后可选做轻量确认注入。
+
+        注意：这不是 gRPC 稳定性的根因判定函数。元宝/豆包历史测试说明 gRPC
+        injectAudio 本身可以长期稳定；若灵宝出现 `Connection reset`，优先排查
+        启动清场、snapshot 状态、App/AudioRecord 时序、导航/唤醒状态，而不是直接
+        归因到 emulator 版本或 gRPC 不稳定。
+
+        本方法仅作为保守等待工具：纯 sleep `settle_sec`（期间不连接/注入），
+        结束后可选做一次轻量确认注入。调用方不应循环探测式重试注入。
+
+        Args:
+            settle_sec: 纯等待秒数（绝不注入），需 >= 实测安全阈值(45s)，默认 50s
+            confirm: 等待结束后是否做一次确认注入（300ms 静音）
+
+        Returns:
+            True=service 就绪(确认注入成功或未要求确认)；False=确认注入失败
+        """
+        logger.info(
+            f"[MicInjector] ⏳ 静默等待 audio service 初始化 "
+            f"({settle_sec:.0f}s，期间绝不注入)..."
+        )
+        # 关键：等待期间绝不 connect/注入，避免打断 service 初始化
+        t0 = time.time()
+        while time.time() - t0 < settle_sec:
+            time.sleep(2.0)
+
+        if not confirm:
+            logger.info(f"[MicInjector] ✅ 静默等待完成 ({settle_sec:.0f}s)")
+            return True
+
+        # 确认注入：此时应已过初始化窗口，第一发即应成功
+        if not self.stub:
+            self.connect()
+        sr, ch, sw = 48000, 1, 2
+        n_samples = int(sr * 100 / 1000)  # 100ms 静音确认
+        silence = b"\x00" * (n_samples * sw * ch)
+        fmt = self._make_audio_format(sr, ch, sw)
+
+        def _gen():
+            yield pb2.AudioPacket(
+                format=fmt,
+                timestamp=int(time.time() * 1_000_000),
+                audio=silence,
+            )
+        try:
+            self.stub.injectAudio(_gen(), timeout=8)
+            logger.info(
+                f"[MicInjector] ✅ audio service 就绪 "
+                f"(静默 {settle_sec:.0f}s + 确认注入 OK)"
+            )
+            return True
+        except grpc.RpcError as e:
+            logger.error(
+                f"[MicInjector] ❌ 确认注入失败(service 仍未就绪): "
+                f"{str(e)[:120]}"
+            )
+            return False
+
     def inject_wav(self, wav_path: str, timeout: float = 30.0) -> float:
         """
         注入 WAV 文件到模拟器麦克风

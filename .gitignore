@@ -33,3 +33,26 @@ venv/
 
 # Benchmark results (local test data)
 voice-benchmark-skill/scripts/results/
+voice-benchmark-skill/results/
+
+# Large binaries — never commit
+*.apk
+*.img
+*.aab
+honor_apks/
+
+# Emulator snapshots
+snapshots/
+
+# Temp diagnostics & dumps
+diagnose_doubao_ui.py
+ui_dump_*.xml
+
+# Logs
+*.log
+
+# Lingbao results (JSON data kept, screenshots excluded)
+voice-benchmark-skill/scripts/lingbao/results/*.png
+voice-benchmark-skill/scripts/lingbao/shots/
+voice-benchmark-skill/scripts/lingbao/calib/
+voice-benchmark-skill/scripts/lingbao/grid/

@@ -105,6 +105,13 @@ class CloudUploader:
             "tested_at": now,
         }
 
+        # Phase 2 锚点（仅 lingbao）：dumpsys 双锚点设备时钟 TTFT，更准。
+        # 后端 schema 未列入时会忽略未知字段；本地报告仍完整保留。
+        dumpsys_ttft = getattr(result, "dumpsys_ttft_ms", None)
+        if dumpsys_ttft is not None:
+            payload["dumpsys_ttft_ms"] = dumpsys_ttft
+            payload["dumpsys_ok"] = getattr(result, "dumpsys_ok", False)
+
         status = "✅" if result.is_valid else "❌"
         ttft_str = f"{payload['ttft_ms']:.0f}ms" if result.is_valid else "N/A"
         logger.info(

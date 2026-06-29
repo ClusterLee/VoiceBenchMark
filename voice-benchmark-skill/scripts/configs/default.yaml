@@ -59,3 +59,16 @@ apps:
     # 豆包有完整的 resource-id
     voice_button_id: "com.larus.nova:id/real_time_call"
     voice_button_xpath: '//android.widget.ImageView[@content-desc="打电话"]'
+
+  # 灵宝（王者荣耀大厅 AI 助手）
+  # ⚠️ Unity 自绘 UI，不连 Appium，导航/检测全用 macOS Vision OCR
+  # 测试前置条件：
+  #   1. AVD `Honor_Lingbao_API_34` 已启动并加载 lingbao_logged_in 快照
+  #   2. 王者荣耀已登录到大厅且账号已绑定灵宝
+  #   3. 屏幕已强制横屏 (脚本会再确认一次)
+  # 详见 scripts/lingbao/navigate_lingbao.sh
+  lingbao:
+    package: "com.tencent.tmgp.sgame"
+    activity: "com.tencent.tmgp.sgame.SGameActivity"
+    response_timeout: 30.0
+    post_login_wait: 3.0

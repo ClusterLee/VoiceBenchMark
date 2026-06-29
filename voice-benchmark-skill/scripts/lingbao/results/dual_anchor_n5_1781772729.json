@@ -1,0 +1,57 @@
+[
+  {
+    "ok": true,
+    "ttft_ms": 4630.0,
+    "in_anchor_db": -14.9,
+    "out_anchor_db": -48.2,
+    "in_baseline_max": -50.8,
+    "out_baseline_max": -50.2,
+    "audio_dur": 1.94,
+    "polls": 31,
+    "idx": 1
+  },
+  {
+    "ok": false,
+    "ttft_ms": -12675.0,
+    "in_anchor_db": -14.8,
+    "out_anchor_db": -49.5,
+    "in_baseline_max": -14.9,
+    "out_baseline_max": -43.0,
+    "audio_dur": 1.94,
+    "polls": 1,
+    "idx": 2
+  },
+  {
+    "ok": false,
+    "ttft_ms": -15257.0,
+    "in_anchor_db": -15.4,
+    "out_anchor_db": -46.7,
+    "in_baseline_max": -19.4,
+    "out_baseline_max": -43.3,
+    "audio_dur": 1.94,
+    "polls": 1,
+    "idx": 3
+  },
+  {
+    "ok": false,
+    "ttft_ms": -16270.0,
+    "in_anchor_db": -15.1,
+    "out_anchor_db": -49.6,
+    "in_baseline_max": -42.0,
+    "out_baseline_max": -40.5,
+    "audio_dur": 1.94,
+    "polls": 1,
+    "idx": 4
+  },
+  {
+    "ok": false,
+    "ttft_ms": -14766.0,
+    "in_anchor_db": -14.8,
+    "out_anchor_db": -46.8,
+    "in_baseline_max": -15.4,
+    "out_baseline_max": -43.2,
+    "audio_dur": 1.94,
+    "polls": 1,
+    "idx": 5
+  }
+]

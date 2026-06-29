@@ -75,6 +75,8 @@ class BenchmarkConfig:
     output_dir: str = "results"
     # 报告格式
     report_formats: list = field(default_factory=lambda: ["json", "csv", "html"])
+    # 灵宝文字模式测试文案（仅 lingbao text 模式使用）
+    lingbao_test_text: str = "你好"
 
 
 @dataclass

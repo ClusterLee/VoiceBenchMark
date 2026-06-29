@@ -34,6 +34,8 @@ from src.audio.recorder import ADBRecorder, SystemAudioRecorder
 from src.audio.virtual_mic import VirtualMicrophone, EmulatorMicInjector
 from src.automation.yuanbao_bot import YuanbaoBot
 from src.automation.doubao_bot import DoubaoBot
+from src.automation.lingbao_bot import LingbaoBot
+from src.automation.lingbao_dumpsys_anchor import LingbaoDumpsysAnchor
 from src.report.generator import ReportGenerator
 
 
@@ -96,6 +98,8 @@ class BenchmarkRunner:
             return YuanbaoBot(device_config, app_config)
         elif target == "doubao":
             return DoubaoBot(device_config, app_config)
+        elif target == "lingbao":
+            return LingbaoBot(device_config, app_config)
         else:
             raise ValueError(f"未知的测试目标: {target}")
 
@@ -1026,50 +1030,116 @@ class BenchmarkRunner:
             call_start = bot.start_voice_call()
             time.sleep(0.5)
 
-            # 2.1 通话已建立，设置通话中音频路由（扬声器 + 通话音量最大）
-            #     必须在通话模式建立后调用，否则通话流音量设置不生效
-            bot._setup_incall_audio()
+            # ── 分支：灵宝文字模式 vs 语音/音频注入模式 ──
+            is_lingbao_text_mode = (
+                target == "lingbao"
+                and hasattr(bot, 'start_text_call')
+            )
 
-            # 2.5 等待 AI 主动问候结束（豆包进入通话后常会主动打招呼）
-            #     如果在 AI 说话时注入音频，会被当噪音丢弃
-            ai_greeting_wait = self._wait_for_ai_greeting_done(target, bot)
-            if ai_greeting_wait > 0:
-                logger.info(f"[{target}] AI 主动问候已结束，等待了 {ai_greeting_wait:.1f}s")
+            if is_lingbao_text_mode:
+                # ════════════════════════════════════════════
+                # 灵宝文字模式（2026-06-25 新增）
+                # 跳过音频注入，改用键盘输入文字
+                # ════════════════════════════════════════════
+                logger.info(f"[{target}] 📝 使用文字交互模式")
 
-            # 3. Appium 预热 —— 让首次轮询不被冷启动拖慢
-            #    在注入音频前做多次检测调用，消除 Appium driver/UiAutomator2 JIT 开销
-            if hasattr(bot, 'detect_ai_response_state'):
-                for warmup_i in range(3):
-                    t_warmup_start = time.time()
-                    bot.detect_ai_response_state()
-                    warmup_ms = (time.time() - t_warmup_start) * 1000
-                    if warmup_i == 0:
-                        logger.info(f"[{target}] Appium 预热 #{warmup_i+1} ({warmup_ms:.0f}ms)")
-                logger.info(f"[{target}] Appium 预热完成 (3 轮)")
-                # 预热后重置检测状态（预热不应影响后续检测）
-                bot.snapshot_baseline_texts()
+                # 2.1 文字模式下不需要 incall_audio（无语音通道）
+                # 2.5 灵宝连续模式下无 AI 主动问候，跳过
+                ai_greeting_wait = 0.0
 
-            # 4. 通过 gRPC 注入测试问题音频
-            self._ensure_injector()
+                # 3. OCR 预热（复用语音模式的预热逻辑）
+                if hasattr(bot, 'detect_ai_response_state'):
+                    for warmup_i in range(3):
+                        t_warmup_start = time.time()
+                        bot.detect_ai_response_state()
+                        warmup_ms = (time.time() - t_warmup_start) * 1000
+                        if warmup_i == 0:
+                            logger.info(f"[{target}] Appium 预热 #{warmup_i+1} ({warmup_ms:.0f}ms)")
+                    logger.info(f"[{target}] Appium 预热完成 (3 轮)")
+                    # 预热后重置 baseline（文字发送前需要干净的 baseline）
+                    bot.snapshot_baseline_texts()
 
-            # 确保 incall_audio 后台设置已完成
-            if hasattr(bot, '_incall_audio_proc') and bot._incall_audio_proc:
-                bot._incall_audio_proc.wait(timeout=10)
-                bot._incall_audio_proc = None
-                logger.debug("通话中音频设置已完成")
+                # 4. 发送文字消息（代替 gRPC 音频注入）
+                test_text = getattr(self.config.benchmark, 'lingbao_test_text', '你好')
+                text_result = bot.start_text_call(text=test_text)
+                t_send = text_result["t_send"]
+                t_inject = t_send          # 兼容后续代码的变量名
+                t_audio_end = t_send       # 文字模式无"播放结束"，用发送时刻代替
 
-            question_path = self._get_question_audio_path()
-            # 动态获取音频时长
-            import wave
-            with wave.open(question_path, "rb") as wf:
-                audio_duration = wf.getnframes() / wf.getframerate()
+                logger.info(
+                    f"[{target}] 文字已发送: 「{test_text}」 "
+                    f"(T={t_send:.4f})"
+                )
 
-            logger.info(f"[{target}] 注入音频: {Path(question_path).name} ({audio_duration:.2f}s)")
-            t_inject = self.injector.inject_wav(question_path)
-            t_audio_end = t_inject + audio_duration  # 音频播放结束时间点
+                dumpsys_anchor = None     # 文字模式不用 dumpsys 锚点
 
-            # 短暂等待让 APP 处理注入的音频
-            time.sleep(0.3)
+            else:
+                # ════════════════════════════════════════════
+                # 原有语音/音频注入模式（元宝 / 豆包 / 灵宝语音）
+                # ════════════════════════════════════════════
+                # 2.1 通话已建立，设置通话中音频路由（扬声器 + 通话音量最大）
+                #     必须在通话模式建立后调用，否则通话流音量设置不生效
+                bot._setup_incall_audio()
+
+                # 2.5 等待 AI 主动问候结束（豆包进入通话后常会主动打招呼）
+                #     如果在 AI 说话时注入音频，会被当噪音丢弃
+                ai_greeting_wait = self._wait_for_ai_greeting_done(target, bot)
+                if ai_greeting_wait > 0:
+                    logger.info(f"[{target}] AI 主动问候已结束，等待了 {ai_greeting_wait:.1f}s")
+
+                # 3. Appium 预热 —— 让首次轮询不被冷启动拖慢
+                if hasattr(bot, 'detect_ai_response_state'):
+                    for warmup_i in range(3):
+                        t_warmup_start = time.time()
+                        bot.detect_ai_response_state()
+                        warmup_ms = (time.time() - t_warmup_start) * 1000
+                        if warmup_i == 0:
+                            logger.info(f"[{target}] Appium 预热 #{warmup_i+1} ({warmup_ms:.0f}ms)")
+                    logger.info(f"[{target}] Appium 预热完成 (3 轮)")
+                    # 预热后重置检测状态（预热不应影响后续检测）
+                    bot.snapshot_baseline_texts()
+
+                # 4. 通过 gRPC 注入测试问题音频
+                self._ensure_injector()
+
+                # 确保 incall_audio 后台设置已完成
+                if hasattr(bot, '_incall_audio_proc') and bot._incall_audio_proc:
+                    bot._incall_audio_proc.wait(timeout=10)
+                    bot._incall_audio_proc = None
+                    logger.debug("通话中音频设置已完成")
+
+                question_path = self._get_question_audio_path()
+                # 动态获取音频时长
+                import wave
+                with wave.open(question_path, "rb") as wf:
+                    audio_duration = wf.getnframes() / wf.getframerate()
+
+                # ── Phase 2 锚点（仅 lingbao）：dumpsys 双锚点测量 ──
+                dumpsys_anchor = None
+                if target == "lingbao":
+                    try:
+                        dumpsys_anchor = LingbaoDumpsysAnchor(logger=logger)
+                        dumpsys_anchor.prime(tap_wake=True)
+                    except Exception as e:
+                        logger.warning(f"[{target}] dumpsys 锚点 prime 失败（降级仅 OCR）: {e}")
+                        dumpsys_anchor = None
+
+                logger.info(f"[{target}] 注入音频: {Path(question_path).name} ({audio_duration:.2f}s)")
+                t_inject = self.injector.inject_wav(question_path)
+                t_audio_end = t_inject + audio_duration  # 音频播放结束时间点
+
+                # 注入后立即启动 dumpsys 后台监听（抓 IN/OUT 锚点）
+                if dumpsys_anchor is not None:
+                    try:
+                        dumpsys_anchor.start(audio_duration)
+                    except Exception as e:
+                        logger.warning(f"[{target}] dumpsys 锚点 start 失败: {e}")
+                        dumpsys_anchor = None
+
+            # ── 注入完成后立即开始 polling，不再 sleep(0.3) ──
+            # 之前的 sleep(0.3) 是历史遗留，会人为给 TTFT 加 300ms 偏置（OCR 检测路径）
+            # APP 在 inject 过程中已实时收到音频（gRPC chunk 流式发送 20ms/chunk），
+            # 注入完成时模型大概率已开始处理，无需再等。
 
             # 4. 精确轮询检测 AI 回复
             app_config = self.config.apps.get(target)
@@ -1077,7 +1147,9 @@ class BenchmarkRunner:
 
             ai_start = 0.0
             ai_end = 0.0
-            poll_interval = 0.05  # 50ms 轮询间隔（高精度检测）
+            # poll_interval 控制空等时长。lingbao OCR 路径单帧 ~80ms（ROI+fast）
+            # 不需要再 sleep；其他 target 走 Appium 端 ~50ms 也够。
+            poll_interval = 0.02  # 20ms 空等上限
             max_polls = int(timeout / poll_interval)
             detection_method = "unknown"
 
@@ -1234,6 +1306,29 @@ class BenchmarkRunner:
                     is_valid=False, error_msg="未检测到 AI 回复",
                 )
 
+            # 5.5 收 Phase 2 dumpsys 双锚点结果（仅 lingbao），合入 result
+            #     dumpsys 监听线程会等到真正抓到 TTS 起播锚点（或 watch_sec 超时）。
+            if dumpsys_anchor is not None:
+                try:
+                    dres = dumpsys_anchor.result(audio_duration)
+                    result.dumpsys_ttft_ms = dres["ttft_ms"]
+                    result.dumpsys_ok = dres["ok"]
+                    result.dumpsys_in_db = dres["in_anchor_db"]
+                    result.dumpsys_out_db = dres["out_anchor_db"]
+                    if dres["ok"]:
+                        ocr_ttft = result.ttfr * 1000 if result.is_valid else 0
+                        delta = (ocr_ttft - dres["ttft_ms"]) if ocr_ttft else None
+                        logger.info(
+                            f"[{target}] 📡 dumpsys 锚点: TTFT={dres['ttft_ms']:.0f}ms "
+                            f"(IN={dres['in_anchor_db']}dB OUT={dres['out_anchor_db']}dB) "
+                            + (f"| OCR={ocr_ttft:.0f}ms, OCR偏置={delta:+.0f}ms"
+                               if delta is not None else "| OCR 未测到")
+                        )
+                    else:
+                        logger.warning(f"[{target}] 📡 dumpsys 锚点未成功（仅 OCR 有效）")
+                except Exception as e:
+                    logger.warning(f"[{target}] dumpsys 锚点 result 失败: {e}")
+
             # 6. 截图留证
             screenshot_path = str(output_dir / f"round_{round_num}_after.png")
             try:
@@ -1253,6 +1348,14 @@ class BenchmarkRunner:
             logger.error(f"[{target}] 第 {round_num + 1} 轮失败: {e}")
             import traceback
             traceback.print_exc()
+
+            # 停掉可能仍在后台跑的 dumpsys 监听线程，避免泄漏
+            _da = locals().get("dumpsys_anchor")
+            if _da is not None:
+                try:
+                    _da.result(0.0)
+                except Exception:
+                    pass
 
             # gRPC 连接错误 → 标记注入器断开
             if ("StatusCode.UNAVAILABLE" in err_msg

@@ -61,6 +61,14 @@ class LatencyResult:
     is_valid: bool = True
     error_msg: str = ""
 
+    # Phase 2 锚点（dumpsys 双锚点，仅 lingbao）：
+    # 用 AudioFlinger Signal power history 测的设备时钟 TTFT，比 OCR 锚点更准。
+    # 默认 None（元宝/豆包及 dumpsys 不可用时不填）。
+    dumpsys_ttft_ms: float = None      # dumpsys 双锚点 TTFT（毫秒，设备时钟）
+    dumpsys_ok: bool = False           # dumpsys 锚点是否成功
+    dumpsys_in_db: float = None        # INPUT 注入到达锚点 dB
+    dumpsys_out_db: float = None       # OUTPUT TTS 起播锚点 dB
+
     def to_dict(self) -> dict:
         return {
             "target": self.target,
@@ -75,6 +83,11 @@ class LatencyResult:
             "ai_speech_end": round(self.ai_speech_end, 4),
             "is_valid": self.is_valid,
             "error_msg": self.error_msg,
+            # Phase 2 dumpsys 锚点（仅 lingbao 有值）
+            "dumpsys_ttft_ms": self.dumpsys_ttft_ms,
+            "dumpsys_ok": self.dumpsys_ok,
+            "dumpsys_in_db": self.dumpsys_in_db,
+            "dumpsys_out_db": self.dumpsys_out_db,
         }
 
 

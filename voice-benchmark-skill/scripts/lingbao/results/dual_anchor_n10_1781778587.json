@@ -1,0 +1,112 @@
+[
+  {
+    "ok": true,
+    "ttft_ms": 3443.0,
+    "in_anchor_db": -14.8,
+    "out_anchor_db": -46.9,
+    "in_baseline_max": -53.2,
+    "out_baseline_max": -53.0,
+    "audio_dur": 1.94,
+    "polls": 27,
+    "idx": 1
+  },
+  {
+    "ok": true,
+    "ttft_ms": 2682.0,
+    "in_anchor_db": -16.1,
+    "out_anchor_db": -49.4,
+    "in_baseline_max": -60.3,
+    "out_baseline_max": -60.1,
+    "audio_dur": 1.94,
+    "polls": 22,
+    "idx": 2
+  },
+  {
+    "ok": true,
+    "ttft_ms": 3232.0,
+    "in_anchor_db": -16.1,
+    "out_anchor_db": -48.8,
+    "in_baseline_max": -61.4,
+    "out_baseline_max": -61.3,
+    "audio_dur": 1.94,
+    "polls": 26,
+    "idx": 3
+  },
+  {
+    "ok": true,
+    "ttft_ms": 4189.0,
+    "in_anchor_db": -15.0,
+    "out_anchor_db": -48.0,
+    "in_baseline_max": -61.4,
+    "out_baseline_max": -61.2,
+    "audio_dur": 1.94,
+    "polls": 28,
+    "idx": 4
+  },
+  {
+    "ok": true,
+    "ttft_ms": 2834.0,
+    "in_anchor_db": -15.1,
+    "out_anchor_db": -47.3,
+    "in_baseline_max": -60.7,
+    "out_baseline_max": -60.6,
+    "audio_dur": 1.94,
+    "polls": 23,
+    "idx": 5
+  },
+  {
+    "ok": true,
+    "ttft_ms": 3328.0,
+    "in_anchor_db": -15.3,
+    "out_anchor_db": -48.2,
+    "in_baseline_max": -57.5,
+    "out_baseline_max": -57.3,
+    "audio_dur": 1.94,
+    "polls": 23,
+    "idx": 6
+  },
+  {
+    "ok": true,
+    "ttft_ms": 4628.0,
+    "in_anchor_db": -15.1,
+    "out_anchor_db": -44.5,
+    "in_baseline_max": -55.7,
+    "out_baseline_max": -55.4,
+    "audio_dur": 1.94,
+    "polls": 34,
+    "idx": 7
+  },
+  {
+    "ok": true,
+    "ttft_ms": 3584.0,
+    "in_anchor_db": -15.2,
+    "out_anchor_db": -43.0,
+    "in_baseline_max": -52.9,
+    "out_baseline_max": -53.0,
+    "audio_dur": 1.94,
+    "polls": 25,
+    "idx": 8
+  },
+  {
+    "ok": true,
+    "ttft_ms": 5078.0,
+    "in_anchor_db": -15.0,
+    "out_anchor_db": -45.6,
+    "in_baseline_max": -52.5,
+    "out_baseline_max": -53.4,
+    "audio_dur": 1.94,
+    "polls": 37,
+    "idx": 9
+  },
+  {
+    "ok": true,
+    "ttft_ms": 3680.0,
+    "in_anchor_db": -15.2,
+    "out_anchor_db": -47.9,
+    "in_baseline_max": -58.9,
+    "out_baseline_max": -58.9,
+    "audio_dur": 1.94,
+    "polls": 25,
+    "idx": 10
+  }
+]
