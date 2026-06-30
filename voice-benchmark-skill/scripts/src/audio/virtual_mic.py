@@ -332,6 +332,108 @@ class EmulatorMicInjector:
         return start_time
 
 
+class PhysicalAudioInjector:
+    """物理音频注入器 — 通过 BlackHole 2ch 虚拟音频设备路由
+
+    当 gRPC injectAudio 不可用（emulator bug / macOS 不兼容）时使用。
+    原理: Mac 播放音频 → BlackHole 2ch(默认输出) → BlackHole 2ch(默认输入) →
+          模拟器虚拟麦克风(连接 host 默认输入) → APP AudioRecord
+
+    前提:
+    - BlackHole 2ch 已安装且设为系统默认输入输出设备
+    - 模拟器不带 -no-audio 启动（需要连接 host 音频）
+
+    精度: ~50-100ms（afplay 启动延迟 + BlackHole 路由延迟）
+    """
+
+    def __init__(self):
+        self.inject_count = 0
+        self._play_proc = None
+        logger.info("[PhysicalAudio] 物理音频注入器已初始化 (BlackHole 2ch 路由)")
+
+    def connect(self):
+        """兼容接口 — 物理音频不需要连接"""
+        logger.info("[PhysicalAudio] 无需连接（物理音频模式）")
+        return True
+
+    def disconnect(self):
+        """兼容接口"""
+        if self._play_proc:
+            self._play_proc.terminate()
+            self._play_proc = None
+
+    def reconnect(self):
+        """兼容接口"""
+        self.disconnect()
+        return self.connect()
+
+    def inject_warmup(self, sr: int = 48000, duration_ms: int = 500):
+        """兼容接口 — 物理音频不需要预热"""
+        logger.debug(f"[PhysicalAudio] warmup 跳过（物理音频模式）")
+
+    def inject_wav(self, wav_path: str, timeout: float = 30.0) -> float:
+        """播放 WAV 文件到 BlackHole 2ch（模拟器虚拟麦克风自动录到）
+
+        Args:
+            wav_path: WAV 文件路径
+            timeout: 超时（秒）
+
+        Returns:
+            播放开始的时间戳（time.time()）
+        """
+        import subprocess
+
+        # 读取 WAV 时长用于日志
+        try:
+            with wave.open(wav_path, 'rb') as wf:
+                duration = wf.getnframes() / wf.getframerate()
+        except Exception:
+            duration = 0
+
+        logger.info(
+            f"[PhysicalAudio] 播放音频: {wav_path} "
+            f"({duration:.2f}s) → BlackHole 2ch → 模拟器麦克风"
+        )
+
+        start_time = time.time()
+
+        # 用 afplay 播放（输出到系统默认输出 = BlackHole 2ch）
+        self._play_proc = subprocess.Popen(
+            ["/usr/bin/afplay", wav_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # 等待播放完成
+        self._play_proc.wait(timeout=timeout)
+        elapsed = time.time() - start_time
+        self.inject_count += 1
+        logger.info(
+            f"[PhysicalAudio] ✅ 播放完成 "
+            f"(音频 {duration:.2f}s, 耗时 {elapsed:.2f}s, "
+            f"累计播放 #{self.inject_count})"
+        )
+
+        return start_time
+
+    def inject_wav_async(self, wav_path: str) -> float:
+        """异步播放（在后台线程中执行）"""
+        import threading
+
+        start_time = time.time()
+
+        def _play():
+            try:
+                self.inject_wav(wav_path)
+            except Exception as e:
+                logger.error(f"[PhysicalAudio] 异步播放错误: {e}")
+
+        t = threading.Thread(target=_play, daemon=True)
+        t.start()
+
+        return start_time
+
+
 # 保留旧的 VirtualMicrophone 作为 ADB 方案的后备
 class VirtualMicrophone:
     """

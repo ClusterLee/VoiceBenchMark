@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.config import load_config, Config, DeviceConfig
 from src.audio.analyzer import AudioAnalyzer, LatencyResult, LatencyStats
 from src.audio.recorder import ADBRecorder, SystemAudioRecorder
-from src.audio.virtual_mic import VirtualMicrophone, EmulatorMicInjector
+from src.audio.virtual_mic import VirtualMicrophone, EmulatorMicInjector, PhysicalAudioInjector
 from src.automation.yuanbao_bot import YuanbaoBot
 from src.automation.doubao_bot import DoubaoBot
 from src.automation.lingbao_bot import LingbaoBot
@@ -63,11 +63,17 @@ class BenchmarkRunner:
         self.recorder = ADBRecorder(
             device_serial=config.device.device_name,
         )
-        # gRPC 音频注入器（主方案）
-        self.injector = EmulatorMicInjector(
-            grpc_host="localhost",
-            grpc_port=config.device.grpc_port if hasattr(config.device, 'grpc_port') else 8554,
-        )
+        # 音频注入器: 优先 gRPC,可通过环境变量 AUDIO_MODE=physical 切换到物理音频
+        audio_mode = os.environ.get("AUDIO_MODE", "grpc")
+        if audio_mode == "physical":
+            logger.info("🔊 音频模式: PhysicalAudioInjector (BlackHole 2ch 路由)")
+            self.injector = PhysicalAudioInjector()
+        else:
+            logger.info("🔊 音频模式: EmulatorMicInjector (gRPC)")
+            self.injector = EmulatorMicInjector(
+                grpc_host="localhost",
+                grpc_port=config.device.grpc_port if hasattr(config.device, 'grpc_port') else 8554,
+            )
         # ADB 后备方案（仅 gRPC 不可用时使用）
         self.virtual_mic = VirtualMicrophone(
             device_serial=config.device.device_name,
@@ -608,10 +614,19 @@ class BenchmarkRunner:
             time.sleep(cls.COOLDOWN_AFTER_CRASH_SECS)
 
         emu = cls._find_emulator()
-        logger.info(
-            f"🚀 [Preflight] 启动模拟器: {emu} -avd {avd_name} "
-            f"-grpc {grpc_port} -gpu host -no-snapshot-load"
-        )
+        # 优先用快照启动(包含已安装的APP和登录态)
+        snapshot_name = os.environ.get("EMU_SNAPSHOT", "yuanbao_doubao_state")
+        use_snapshot = bool(snapshot_name)
+        if use_snapshot:
+            logger.info(
+                f"🚀 [Preflight] 启动模拟器(快照): {emu} -avd {avd_name} "
+                f"-snapshot {snapshot_name} -grpc {grpc_port} -gpu host"
+            )
+        else:
+            logger.info(
+                f"🚀 [Preflight] 启动模拟器: {emu} -avd {avd_name} "
+                f"-grpc {grpc_port} -gpu host -no-snapshot-load"
+            )
 
         # 设置环境变量（确保 Android SDK 工具链可用）
         env = os.environ.copy()
@@ -624,15 +639,26 @@ class BenchmarkRunner:
             )
 
         try:
-            subprocess.Popen(
-                [emu, "-avd", avd_name,
-                 "-grpc", str(grpc_port),
-                 "-gpu", "host",
-                 "-no-snapshot-load"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=env,
-            )
+            if use_snapshot:
+                subprocess.Popen(
+                    [emu, "-avd", avd_name,
+                     "-snapshot", snapshot_name,
+                     "-grpc", str(grpc_port),
+                     "-gpu", "host"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
+                )
+            else:
+                subprocess.Popen(
+                    [emu, "-avd", avd_name,
+                     "-grpc", str(grpc_port),
+                     "-gpu", "host",
+                     "-no-snapshot-load"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
+                )
         except FileNotFoundError:
             logger.error(f"❌ [Preflight] 找不到 emulator: {emu}")
             return False
@@ -641,7 +667,8 @@ class BenchmarkRunner:
         # Android 14 冷启动通常需 45-90s，而 boot_completed=1 有可能被
         # userdata 缓存"骗"得过早返回（尤其是 -no-snapshot-load 时）。
         # 强制最少等 30s 再开始 poll，避免假阳性 ready。
-        MIN_BOOT_WAIT = 30
+        # 快照启动很快(~10s),减少最小等待
+        MIN_BOOT_WAIT = 10 if use_snapshot else 30
         logger.info(f"⏳ [Preflight] 最少等待 {MIN_BOOT_WAIT}s 再开始检测 boot...")
         time.sleep(MIN_BOOT_WAIT)
 
@@ -855,17 +882,23 @@ class BenchmarkRunner:
         return ttft_ms > threshold_ms
 
     def _ensure_injector(self):
-        """确保 gRPC 注入器已连接
+        """确保音频注入器已连接
+
+        优先使用 gRPC EmulatorMicInjector;如果 gRPC injectAudio 不可用
+        (emulator bug),自动切换到 PhysicalAudioInjector (BlackHole 2ch 路由)。
 
         检查两个条件:
         1. _injector_connected 标志
-        2. injector.stub 是否存在（inject_wav 失败后会被清空）
-        任一条件不满足都会触发重连。
+        2. injector 是否就绪(gRPC: stub 存在;物理: 无需连接)
         """
-        if not self._injector_connected or self.injector.stub is None:
+        # 物理音频模式: 无需连接,直接返回
+        if isinstance(self.injector, PhysicalAudioInjector):
+            self._injector_connected = True
+            return
+
+        if not self._injector_connected or getattr(self.injector, 'stub', None) is None:
             try:
-                if self.injector.stub is None and self._injector_connected:
-                    # stub 被清空但标志还在 → gRPC 连接级错误导致的自动断开
+                if getattr(self.injector, 'stub', None) is None and self._injector_connected:
                     logger.warning("gRPC channel 已失效（连接级错误），重建连接...")
                     self._injector_connected = False
                 self.injector.connect()
@@ -1453,21 +1486,85 @@ class BenchmarkRunner:
             )
             sys.exit(1)
 
-        # 5. 重建 gRPC 连接 + warmup 探活
-        try:
-            self.injector.reconnect()
+        # 5. 重建音频注入器 + warmup 探活
+        # 物理音频模式: 无需 gRPC warmup,直接跳过
+        if isinstance(self.injector, PhysicalAudioInjector):
+            logger.info("✅ [FullReset] 物理音频模式,无需 gRPC warmup")
             self._injector_connected = True
-            # reconnect() 只建 channel；qemu 崩溃恢复后 channel 可能
-            # 能 3-way 握手但实际 injectAudio 会 RST。做一次 warmup 才能
-            # 确认管道真的通。
-            self.injector.inject_warmup(duration_ms=300)
-            logger.info("✅ [FullReset] gRPC 连接已重建并 warmup 通过")
-        except Exception as e:
-            logger.error(
-                f"❌ [FullReset] gRPC 重建/warmup 失败: {e} → 退出进程，"
-                f"交给外壳循环重新启动"
-            )
-            sys.exit(1)
+        else:
+            # gRPC 模式: warmup 探活(带重试)
+            grpc_ok = False
+            for grpc_attempt in range(3):
+                try:
+                    self.injector.reconnect()
+                    self._injector_connected = True
+                    self.injector.inject_warmup(duration_ms=300)
+                    logger.info("✅ [FullReset] gRPC 连接已重建并 warmup 通过")
+                    grpc_ok = True
+                    break
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ [FullReset] gRPC warmup 第{grpc_attempt+1}次失败: {e}"
+                    )
+                    self.injector.disconnect()
+                    self._injector_connected = False
+                    if grpc_attempt < 2:
+                        # warmup 失败 = qemu 可能已崩溃。重启模拟器(冷启动)再试。
+                        logger.warning(
+                            f"   qemu 可能已崩溃,重启模拟器(冷启动)..."
+                        )
+                        # 清理残留
+                        pkill_patterns = [
+                            "qemu-system-aarch64",
+                            "crashpad_handler.*emu-crash",
+                            "CrashReporterSupport",
+                        ]
+                        for pat in pkill_patterns:
+                            try:
+                                subprocess.run(["pkill", "-f", pat],
+                                             capture_output=True, timeout=5)
+                            except Exception:
+                                pass
+                        adb = self._find_adb()
+                        try:
+                            subprocess.run([adb, "kill-server"], capture_output=True, timeout=5)
+                            time.sleep(1)
+                            subprocess.run([adb, "start-server"], capture_output=True, timeout=5)
+                            time.sleep(2)
+                        except Exception:
+                            pass
+                        # 冷启动模拟器
+                        avd = getattr(self.config.device, 'avd_name', 'Pixel_6_API_34')
+                        grpc_port = getattr(self.config, '_grpc_port', 8554)
+                        emu = self._find_emulator()
+                        env = os.environ.copy()
+                        android_home = os.path.expanduser("~/Library/Android/sdk")
+                        if os.path.isdir(android_home):
+                            env["ANDROID_HOME"] = android_home
+                            env["PATH"] = f"{android_home}/emulator:{android_home}/platform-tools:" + env.get("PATH", "")
+                        logger.info(f"   冷启动: {emu} -avd {avd} -grpc {grpc_port} -gpu host -no-snapshot-load")
+                        subprocess.Popen(
+                            [emu, "-avd", avd, "-grpc", str(grpc_port),
+                             "-gpu", "host", "-no-snapshot-load"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+                        )
+                        logger.info(f"   等待冷启动 boot_completed (最多120s)...")
+                        time.sleep(30)
+                        for _ in range(18):
+                            if self._is_emulator_running() and self._is_emulator_booted():
+                                break
+                            time.sleep(5)
+                        if not (self._is_emulator_running() and self._is_emulator_booted()):
+                            logger.error(f"   冷启动 boot 超时")
+                            continue
+                        logger.info(f"   ✅ 冷启动完成,等30s让gRPC稳定...")
+                        time.sleep(30)
+                    else:
+                        logger.error(
+                            f"❌ [FullReset] gRPC 重建/warmup 3次均失败 → 退出进程，"
+                            f"交给外壳循环重新启动"
+                        )
+                        sys.exit(1)
 
         # 5.5 gRPC 重连后再次验证 adb
         if not self._wait_for_adb_device(timeout=120):
